@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-tiles example</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1d2733; color: #e8eef5; font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #panel { position: fixed; left: 12px; top: 12px; background: rgba(12, 18, 26, .85); border: 1px solid #34465a; border-radius: 8px; padding: 10px 12px; width: 250px; }
+  #panel h1 { font-size: 14px; margin: 0 0 8px; }
+  #panel label { display: grid; grid-template-columns: 62px 1fr; align-items: center; gap: 6px; margin: 4px 0; }
+  #panel input { width: 100%; box-sizing: border-box; background: #0f1620; color: inherit; border: 1px solid #34465a; border-radius: 4px; padding: 3px 6px; font: inherit; }
+  #panel button { margin-top: 6px; width: 100%; padding: 5px; background: #2d6cdf; color: #fff; border: 0; border-radius: 4px; font: inherit; cursor: pointer; }
+  #panel button:hover { background: #3a7cf0; }
+  #panel .row { display: flex; gap: 10px; margin-top: 6px; }
+  #panel .row label { display: flex; grid-template-columns: none; gap: 4px; margin: 0; white-space: nowrap; }
+  #status { margin-top: 8px; white-space: pre-wrap; color: #9fb3c8; }
+  #attrib { position: fixed; right: 8px; bottom: 6px; font-size: 11px; color: #9fb3c8; background: rgba(12, 18, 26, .7); padding: 3px 8px; border-radius: 4px; }
+  #help { position: fixed; left: 12px; bottom: 6px; font-size: 11px; color: #7f93a8; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <h1>open-tiles example</h1>
+  <label>server <input id="server" placeholder="same origin"></label>
+  <label>lat <input id="lat" type="number" step="0.0001"></label>
+  <label>lon <input id="lon" type="number" step="0.0001"></label>
+  <label>zoom <input id="zoom" type="number" min="1" max="22"></label>
+  <label>tiles <input id="n" type="number" min="1" max="15" title="n × n tiles around the centre"></label>
+  <div class="row">
+    <label><input id="wire" type="checkbox"> wireframe</label>
+    <label><input id="grid" type="checkbox"> Y=0 grid</label>
+  </div>
+  <button id="load">Load</button>
+  <div id="status">…</div>
+</div>
+<div id="help">drag: rotate · right-drag: pan · wheel: zoom</div>
+<div id="attrib">Imagery © Esri · Elevation: Mapzen Terrain Tiles (AWS Open Data)</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------------------------------------------------------------------------
+// parameters: URL query → inputs; "Load" writes them back to the URL
+
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const defaults = { server: '', lat: 36.07, lon: -112.10, zoom: 14, n: 5 };
+for (const k of Object.keys(defaults)) $(k).value = params.get(k) ?? defaults[k];
+$('wire').checked = params.has('wire');
+$('grid').checked = params.has('grid');
+$('load').onclick = () => {
+  const p = new URLSearchParams();
+  for (const k of Object.keys(defaults)) if ($(k).value !== '') p.set(k, $(k).value);
+  if ($('wire').checked) p.set('wire', '');
+  if ($('grid').checked) p.set('grid', '');
+  location.search = p.toString();
+};
+
+// ---------------------------------------------------------------------------
+// slippy-map math (same formulas as the server's tile.rs)
+
+function tileAt(lat, lon, zoom) {
+  const n = 2 ** zoom;
+  const latRad = lat * Math.PI / 180;
+  const x = Math.floor((lon + 180) / 360 * n);
+  const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+  return { x: Math.min(Math.max(x, 0), n - 1), y: Math.min(Math.max(y, 0), n - 1) };
+}
+
+// ---------------------------------------------------------------------------
+// scene
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1d2733);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 1, 5_000_000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(0.6, 1.0, 0.4);
+scene.add(sun);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const wire = $('wire').checked;
+const wireMaterial = new THREE.MeshBasicMaterial({ wireframe: true, color: 0x8ef59a });
+
+// ---------------------------------------------------------------------------
+// load the n × n block around (lat, lon) at zoom
+//
+// Placement follows the tile convention: origin at the tile's NW corner,
+// +X east, +Z south, Y = metres above sea level — so every tile goes at
+// (dx · S, 0, dy · S). Tiles are scaled by S / tile_size_m in X/Z so rows
+// with slightly different Mercator sizes still meet exactly (a uniform grid
+// as the engines use; see README "size_m").
+
+const zoom = Number($('zoom').value), n = Math.max(1, Number($('n').value));
+const server = ($('server').value || location.origin).replace(/\/$/, '');
+const centre = tileAt(Number($('lat').value), Number($('lon').value), zoom);
+const x0 = centre.x - Math.floor(n / 2), y0 = centre.y - Math.floor(n / 2);
+const loader = new GLTFLoader();
+const status = $('status');
+let loaded = 0, failed = 0, S = null, ymin = Infinity, ymax = -Infinity, first = true;
+
+const report = () => {
+  status.textContent =
+    `centre tile ${zoom}/${centre.x}/${centre.y}\n` +
+    `loaded ${loaded}/${n * n}${failed ? `, missing ${failed}` : ''}` +
+    (S ? `\ntile ${S.toFixed(1)} m · Y ${ymin.toFixed(0)}…${ymax.toFixed(0)} m` : '');
+};
+
+const frameCamera = () => {
+  const extent = n * S;
+  const cx = extent / 2 - S / 2, cz = extent / 2 - S / 2, cy = (ymin + ymax) / 2;
+  controls.target.set(cx, cy, cz);
+  camera.position.set(cx, cy + extent * 0.9, cz + extent * 1.1);
+  camera.near = Math.max(1, extent / 5000);
+  camera.far = extent * 50;
+  camera.updateProjectionMatrix();
+  controls.update();
+  if ($('grid').checked) {
+    const grid = new THREE.GridHelper(extent * 1.5, 30, 0x66aaff, 0x33557a);
+    grid.position.set(cx, 0, cz);
+    scene.add(grid);
+  }
+};
+
+for (let dy = 0; dy < n; dy++) for (let dx = 0; dx < n; dx++) {
+  const url = `${server}/${zoom}/${x0 + dx}/${y0 + dy}.glb`;
+  loader.load(url, gltf => {
+    const extras = gltf.parser.json.extras ?? {};
+    const size = extras.tile_size_m;
+    if (S === null) S = size;            // first tile's size defines the grid
+    gltf.scene.traverse(o => {
+      if (!o.isMesh) return;
+      if (wire) o.material = wireMaterial;
+      const bb = o.geometry.boundingBox;
+      ymin = Math.min(ymin, bb.min.y);
+      ymax = Math.max(ymax, bb.max.y);
+    });
+    gltf.scene.position.set(dx * S, 0, dy * S);
+    gltf.scene.scale.set(S / size, 1, S / size);
+    scene.add(gltf.scene);
+    loaded++;
+    report();
+    if (first) { first = false; frameCamera(); }
+  }, undefined, err => {
+    failed++;
+    console.warn('tile failed', url, err);
+    report();
+  });
+}
+report();
+
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>

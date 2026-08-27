@@ -101,8 +101,8 @@ Approved output shape:
    provider serves (no "native zoom" concept); per-zoom resolution table (`detailed.md` §5).
 4. **Server** — XYZ route over the same builder; output cache; dedup of concurrent builds;
    error/404 semantics; cache headers; attribution.
-5. **Consumer proof** — load a neighbourhood of tiles in a stock glTF viewer and in
-   bevytiles/raytiles to confirm alignment and scale.
+5. **Browser example** — a plain three.js page in `example/` (also served at `/example/`) that
+   loads a predefined n × n block around a lat/lon from the server and lets you orbit it.
 
 ## 8. Future (not part of this plan)
 

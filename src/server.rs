@@ -192,6 +192,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/example", get(example))
+        .route("/example/", get(example))
         // the router can't split `{y}.glb` inside one segment; the handler does
         .route("/{z}/{x}/{y}", get(tile))
         .with_state(state)
@@ -225,6 +227,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
         "version": env!("CARGO_PKG_VERSION"),
         "fingerprint": state.fingerprint,
         "tiles": "/{z}/{x}/{y}.glb",
+        "example": "/example/",
         "zoom": { "min": crate::tile::MIN_ZOOM, "max": crate::tile::MAX_ZOOM },
         "resolution": cfg.resolution,
         "conventions": {
@@ -245,6 +248,23 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
                 (header::CACHE_CONTROL, "no-cache"),
             ],
             body.to_string(),
+        )
+            .into_response(),
+    )
+}
+
+/// The bundled three.js viewer (`example/index.html`), embedded at compile
+/// time so `open-tiles serve` is a complete demo on its own.
+async fn example(State(state): State<Arc<AppState>>) -> Response {
+    finish(
+        state.serve.cors,
+        (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            include_str!("../example/index.html"),
         )
             .into_response(),
     )

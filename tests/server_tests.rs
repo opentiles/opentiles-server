@@ -183,6 +183,14 @@ async fn index_health_and_no_cors() {
     assert_eq!(v["resolution"][0], 17);
     let (status, _, body) = get(format!("{base}/healthz"), None).await;
     assert_eq!((status, body.as_slice()), (200, &b"ok"[..]));
+    assert_eq!(v["example"], "/example/");
+    for path in ["/example", "/example/"] {
+        let (status, h, body) = get(format!("{base}{path}"), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(header(&h, "content-type"), Some("text/html; charset=utf-8"));
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains("GLTFLoader") && html.contains("/${zoom}/${x0 + dx}/${y0 + dy}.glb"));
+    }
 }
 
 #[test]

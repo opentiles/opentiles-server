@@ -6,8 +6,24 @@ On-demand **3D terrain tiles as GLB**, at 1:1 world scale, addressed like a slip
 Esri imagery — but with the heights baked into real geometry, so any glTF loader can show the
 terrain without a custom shader.
 
-Status: **milestones 1–4** — builder library, CLI, any zoom 1–22, HTTP server. See
-`outline.md` / `detailed.md`.
+Status: **milestones 1–5** — builder library, CLI, any zoom 1–22, HTTP server, browser example.
+See `outline.md` / `detailed.md`.
+
+## Try it
+
+```sh
+cargo run --release -- serve
+open http://127.0.0.1:8080/example/
+```
+
+The bundled [`example/index.html`](example/index.html) is a plain three.js page: pick a
+lat/lon, zoom and an n × n block of tiles, press **Load**, then orbit (drag), pan (right-drag)
+and zoom (wheel). Parameters live in the URL, e.g.
+`/example/?lat=36.07&lon=-112.10&zoom=14&n=5` — the Grand Canyon default — or
+`/example/?lat=32.08&lon=34.77&zoom=14&n=3&grid` for the Tel Aviv shoreline with a sea-level
+grid. It uses the tile convention directly: tile `(x, y)` sits at `(dx · S, 0, dy · S)`, scaled
+by `S / tile_size_m` in X/Z so Mercator rows meet exactly. The same file works from any static
+server (`python3 -m http.server` inside `example/`, then set the *server* field) thanks to CORS.
 
 ## Server
 
@@ -30,7 +46,8 @@ curl -I http://127.0.0.1:8080/12/772/1607.glb
 - `If-None-Match` → `304`; `HEAD` supported; `400` invalid tile; `404` nothing upstream at any
   zoom (`max-age=3600`); `502` upstream failure; `500` decode/I/O. JSON error bodies.
 - CORS `*` by default (`--no-cors`). `GET /` returns name, version, fingerprint, URL template,
-  resolution table, conventions and attribution; `GET /healthz` → `ok`.
+  resolution table, conventions and attribution; `GET /healthz` → `ok`; `GET /example/` is the
+  bundled viewer.
 - Provider flags (`--texture-url`, `--heightmap-url`, `--texture-max-zoom`,
   `--heightmap-max-zoom`, `--timeout`) work as for `build`.
 

@@ -1,9 +1,9 @@
 # OPEN-TILES — Detailed Plan: Milestones 1 & 2
 
-> Covers **Milestone 1 (builder core)**, **Milestone 2 (CLI)**, **Milestone 3 (any zoom)** and
-> **Milestone 4 (HTTP server)** from `outline.md`. Milestone 5 (consumer proof) is out of scope here.
+> Covers all five milestones from `outline.md`: builder core, CLI, any zoom, HTTP server, and
+> the browser example.
 > §0 records the decisions taken on this plan (2026-08-28).
-> **Status (2026-08-28): milestones 1–4 implemented** (acceptance runs recorded at the end of §5 and §6) — `cargo test` (34 tests, offline)
+> **Status (2026-08-28): all five milestones implemented** (acceptance runs recorded at the end of §5, §6 and §7) — `cargo test` (34 tests, offline)
 > green, clippy/fmt clean, 3×3 Grand Canyon block at z12 validated (official glTF validator:
 > 0 errors/warnings on all 9 files) and inspected in a three.js viewer — watertight seams,
 > imagery aligned with relief, Y range 707–2 489 m. Deviations from the plan are marked **[impl]**.
@@ -508,10 +508,35 @@ loaded the z16 block straight from the server (CORS).
 
 ---
 
-## 7. Explicitly deferred (not in these milestones)
+## 7. Milestone 5 — Browser example (`example/`)
+
+Ziv (2026-08-28): replace the original "consumer proof in the engines" with a simple three.js
+implementation in this repo that loads a predefined area (n × n tiles) and lets you view and
+rotate it. Implemented in the same pass.
+
+- **`example/index.html`** — one file, no build step: three.js 0.170 via an import map (unpkg),
+  `GLTFLoader` + `OrbitControls`. A small panel (server, lat, lon, zoom, n, wireframe,
+  sea-level grid) whose values live in the URL query (`?lat=…&lon=…&zoom=…&n=…`); **Load**
+  reloads with the new parameters. Default area: Grand Canyon, z14, 5 × 5.
+- **Placement** is the tile convention verbatim: centre tile from the same Mercator formula as
+  `tile.rs`, block origin `centre − floor(n/2)`, tile `(dx, dy)` at `(dx·S, 0, dy·S)` where `S`
+  is the first loaded tile's `extras.tile_size_m`, and each tile scaled by `S / tile_size_m` in
+  X/Z so rows with slightly different Mercator sizes meet exactly. Camera framed from the loaded
+  block's extent and Y range; status shows progress, missing tiles, tile size and Y range;
+  attribution footer.
+- **Served by the server at `/example/`** (`include_str!` at compile time, `text/html`), listed
+  in the `/` JSON as `example`; also runs from any static server against a remote `server`
+  value (CORS). Tests: `/example` and `/example/` return the page.
+- **Acceptance (2026-08-28, passed):** `open-tiles serve` → `/example/` loaded the 5 × 5
+  Grand Canyon block at z14 (25/25 tiles, cold-built by the server in ~20 s; Y 724–2 229 m),
+  drag-rotate worked; `?lat=32.08&lon=34.77&zoom=14&n=3&grid` loaded 9/9 shoreline tiles on the
+  Y = 0 grid; no console errors.
+
+---
+
+## 8. Explicitly deferred
 
 - Output-cache eviction / size limits; metrics endpoint; request compression.
-- A built-in browser viewer route (candidate for milestone 5).
 - Antimeridian wrap for neighbour lookup.
 - Fixing cracks at a provider's coverage boundary (§5.1 watertightness statement).
 - TTL / automatic expiry for `.404` markers.
