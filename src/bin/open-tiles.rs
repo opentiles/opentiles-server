@@ -1,5 +1,5 @@
-//! `open-tiles` CLI: build one terrain tile as a GLB, look up which tile
-//! covers a coordinate, or clear negative-cache markers.
+//! `open-tiles` CLI: build one terrain tile as a GLB, serve tiles over HTTP,
+//! look up which tile covers a coordinate, or clear negative-cache markers.
 //!
 //! Exit codes: 0 ok · 2 usage / invalid tile · 3 nothing upstream at any
 //! zoom · 4 network, decode or I/O failure.
@@ -8,6 +8,7 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use open_tiles::fetch::Fetcher;
 use open_tiles::provider::Kind;
+use open_tiles::server::ServeConfig;
 use open_tiles::{build_tile, Config, Error, TileId};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -32,6 +33,8 @@ enum Cmd {
     Build(BuildArgs),
     /// Print the tile covering a lat/lon at a zoom, with its bounds and size.
     Lookup(LookupArgs),
+    /// Serve tiles over HTTP: GET /{z}/{x}/{y}.glb, built on demand and cached.
+    Serve(ServeArgs),
     /// Forget cached 404s so the providers are asked again.
     #[command(name = "refresh-404")]
     Refresh404(RefreshArgs),
@@ -55,6 +58,12 @@ struct BuildArgs {
     /// per-zoom table and is capped by the height source's useful ceiling.
     #[arg(long)]
     resolution: Option<u32>,
+    #[command(flatten)]
+    provider: ProviderArgs,
+}
+
+#[derive(Args)]
+struct ProviderArgs {
     /// Imagery URL template (:zoom:/:x:/:y: tokens).
     #[arg(long)]
     texture_url: Option<String>,
@@ -67,9 +76,45 @@ struct BuildArgs {
     /// Deepest zoom to ask the heightmap provider for before deriving (default 15).
     #[arg(long)]
     heightmap_max_zoom: Option<u8>,
-    /// HTTP read timeout in seconds.
+    /// HTTP read timeout in seconds for upstream fetches.
     #[arg(long, default_value_t = 10)]
     timeout: u64,
+}
+
+impl ProviderArgs {
+    fn apply(self, cfg: &mut Config) {
+        cfg.read_timeout = Duration::from_secs(self.timeout);
+        if let Some(u) = self.texture_url {
+            cfg.provider.texture_url = u;
+        }
+        if let Some(u) = self.heightmap_url {
+            cfg.provider.heightmap_url = u;
+        }
+        if let Some(z) = self.texture_max_zoom {
+            cfg.provider.texture_max_zoom = z;
+        }
+        if let Some(z) = self.heightmap_max_zoom {
+            cfg.provider.heightmap_max_zoom = z;
+        }
+    }
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    /// Address to listen on.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    bind: std::net::SocketAddr,
+    /// Input + output cache root.
+    #[arg(long, default_value = ".cache")]
+    cache_dir: PathBuf,
+    /// Concurrent tile builds (default: CPU count).
+    #[arg(long)]
+    max_builds: Option<usize>,
+    /// Do not send Access-Control-Allow-Origin: *.
+    #[arg(long)]
+    no_cors: bool,
+    #[command(flatten)]
+    provider: ProviderArgs,
 }
 
 #[derive(Args)]
@@ -109,6 +154,7 @@ fn main() {
     let code = match cli.cmd {
         Cmd::Build(a) => run_build(a),
         Cmd::Lookup(a) => run_lookup(a),
+        Cmd::Serve(a) => run_serve(a),
         Cmd::Refresh404(a) => run_refresh(a),
     };
     std::process::exit(code);
@@ -121,23 +167,11 @@ fn run_build(a: BuildArgs) -> i32 {
     };
     let mut cfg = Config {
         cache_dir: a.cache_dir,
-        read_timeout: Duration::from_secs(a.timeout),
         ..Config::default()
     };
+    a.provider.apply(&mut cfg);
     if let Some(r) = a.resolution {
         cfg.set_resolution(tile.zoom, r);
-    }
-    if let Some(u) = a.texture_url {
-        cfg.provider.texture_url = u;
-    }
-    if let Some(u) = a.heightmap_url {
-        cfg.provider.heightmap_url = u;
-    }
-    if let Some(z) = a.texture_max_zoom {
-        cfg.provider.texture_max_zoom = z;
-    }
-    if let Some(z) = a.heightmap_max_zoom {
-        cfg.provider.heightmap_max_zoom = z;
     }
     let output = a
         .output
@@ -177,6 +211,30 @@ fn run_lookup(a: LookupArgs) -> i32 {
         tile.zoom, tile.x, tile.y
     );
     0
+}
+
+fn run_serve(a: ServeArgs) -> i32 {
+    let mut cfg = Config {
+        cache_dir: a.cache_dir,
+        ..Config::default()
+    };
+    a.provider.apply(&mut cfg);
+    let mut serve = ServeConfig {
+        bind: a.bind,
+        cors: !a.no_cors,
+        ..ServeConfig::default()
+    };
+    if let Some(n) = a.max_builds {
+        serve.max_builds = n.max(1);
+    }
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => return fail(4, &anyhow::Error::from(e).context("starting the runtime")),
+    };
+    match rt.block_on(open_tiles::server::run(cfg, serve)) {
+        Ok(()) => 0,
+        Err(e) => fail(4, &anyhow::Error::from(e).context("serving")),
+    }
 }
 
 fn run_refresh(a: RefreshArgs) -> i32 {

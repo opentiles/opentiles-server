@@ -1,9 +1,9 @@
 # OPEN-TILES — Detailed Plan: Milestones 1 & 2
 
-> Covers **Milestone 1 (builder core)**, **Milestone 2 (CLI)** and **Milestone 3 (greater
-> zoom)** from `outline.md`. Milestones 4–5 (server, consumer proof) are out of scope here.
+> Covers **Milestone 1 (builder core)**, **Milestone 2 (CLI)**, **Milestone 3 (any zoom)** and
+> **Milestone 4 (HTTP server)** from `outline.md`. Milestone 5 (consumer proof) is out of scope here.
 > §0 records the decisions taken on this plan (2026-08-28).
-> **Status (2026-08-28): milestones 1, 2 and 3 implemented** (§5 acceptance recorded at its end) — `cargo test` (34 tests, offline)
+> **Status (2026-08-28): milestones 1–4 implemented** (acceptance runs recorded at the end of §5 and §6) — `cargo test` (34 tests, offline)
 > green, clippy/fmt clean, 3×3 Grand Canyon block at z12 validated (official glTF validator:
 > 0 errors/warnings on all 9 files) and inspected in a three.js viewer — watertight seams,
 > imagery aligned with relief, Y range 707–2 489 m. Deviations from the plan are marked **[impl]**.
@@ -457,9 +457,61 @@ and the coast sits exactly on a Y = 0 reference grid in the viewer; land tiles r
 
 ---
 
-## 6. Explicitly deferred (not in these milestones)
+## 6. Milestone 4 — HTTP server
 
-- HTTP server, output cache, in-flight dedup (milestone 4).
+Goal: `open-tiles serve` answers `GET /{z}/{x}/{y}.glb` with the same bytes the CLI writes,
+building on first request, serving from an output cache afterwards, and never building the same
+tile twice concurrently. Ziv said "go milestone 4" (2026-08-28); the decisions below were taken
+with sensible defaults and implemented in the same pass — each is one line to flip.
+
+### 6.0 Decisions (defaults taken)
+
+| # | Decision | Default | Why |
+|---|---|---|---|
+| 6.0.1 | HTTP stack | **axum 0.8 + tokio** | The standard Rust service stack; graceful shutdown, HEAD, keep-alive and later CORS/compression/metrics come for free. The builder stays blocking (ureq + threads) and runs under `spawn_blocking` behind a semaphore. A sync `tiny_http` server would have been smaller but is a dead end for the follow-ups. |
+| 6.0.2 | Output cache location | `{cache_dir}/glb/{fingerprint}/{z}/{x}/{y}.glb` | Tier 2 of the two-tier cache (outline §6). The **fingerprint** is a hash of everything that changes the bytes: crate version, resolution table, provider URLs + zoom hints, JPEG quality — so a config change can never serve stale geometry; old fingerprints are just directories to delete. |
+| 6.0.3 | In-flight dedup | one build per tile key; concurrent requests await the same result | `Mutex<HashMap<TileId, watch::Receiver>>`: the first request is the leader (acquires a build permit, builds, writes the cache file, removes the entry, publishes), the rest wait on the channel. Late arrivals after publication hit the cache file. Failures are published too, so waiters fail fast instead of each retrying upstream. |
+| 6.0.4 | Build concurrency | `--max-builds` = CPU count | Each build fans out ~10 upstream fetches on its own threads; the semaphore bounds CPU and upstream pressure. |
+| 6.0.5 | Response semantics | `200 model/gltf-binary`, `Cache-Control: public, max-age=31536000, immutable`, `ETag "{fingerprint}-{len}"` with `If-None-Match → 304`; `400` invalid tile; `404` nothing upstream at any zoom (`max-age=3600`); `502` upstream network/HTTP failure (`no-store`); `500` decode/I/O. JSON error bodies. | Tiles are immutable per fingerprint, so a CDN in front can cache forever; the URL never changes across config changes, only the bytes/ETag. |
+| 6.0.6 | CORS | `Access-Control-Allow-Origin: *` on by default (`--no-cors`) | Browser viewers (three.js, Cesium) are the first consumers; a public tile server without CORS is unusable from a page. |
+| 6.0.7 | Extra routes | `GET /` (JSON: name, version, fingerprint, url template, resolution table, attribution), `GET /healthz` | Enough for a load balancer and for a client to discover attribution. No metrics endpoint in v1. |
+| 6.0.8 | No broker | in-process queue + dedup only | As discussed earlier; the `submit` step is one function, swappable if replicas ever share a build farm. |
+
+### 6.1 Steps
+
+- **4.1 `server.rs`** (library): `ServeConfig { bind, max_builds, cors }`, `fingerprint(&Config)`,
+  `output_path`, `AppState`, the dedup (`Inflight`), the `tile` / `index` / `healthz` handlers,
+  `router(state)` and `run(cfg, serve_cfg)` (graceful shutdown on Ctrl-C).
+- **4.2 CLI** `open-tiles serve [--bind 127.0.0.1:8080] [--cache-dir] [--max-builds N]
+  [--no-cors] [provider flags as in build]`; logs one line per build, debug per cache hit.
+- **4.3 Tests** (`tests/server_tests.rs`, offline): router mounted on an ephemeral port inside
+  a tokio runtime, requests via `ureq` — 200 + headers + bytes identical to `build_tile`; second
+  request served from the output cache; **N concurrent requests for one tile → upstream fetched
+  once** (local provider counts hits); `If-None-Match` → 304; bad tile → 400; nothing upstream →
+  404; fingerprint changes with the resolution table; `/` and `/healthz`.
+- **4.4 Acceptance:** serve with the warm cache from milestones 1–3; `curl -I` shows the headers;
+  the three.js viewer page loads tiles straight from `http://127.0.0.1:8080/{z}/{x}/{y}.glb`
+  (CORS); a cold z16 tile builds on demand; repeat request is a cache hit.
+
+**Milestone 4 exit criteria:** tests green; acceptance passes; `cargo run -- serve` is all a
+consumer needs.
+
+**Status (2026-08-28): implemented.** `src/server.rs` (axum 0.8 + tokio, blake3 fingerprint),
+`open-tiles serve`, 5 server tests + 1 unit test (52 total). **[impl]** the router matches
+`/{z}/{x}/{y}` and the handler parses the `.glb` suffix (axum's matcher can't split a segment).
+**Acceptance run:** warm input cache → first `GET /12/772/1607.glb` built in 13 ms, second served
+from `glb/<fingerprint>/` in 2.5 ms; headers `model/gltf-binary`, `immutable`, ETag, CORS `*`;
+`If-None-Match` → 304; `/3/9/0.glb` → 400 JSON, `.gltf` → 400; cold `/16/12359/25716.glb` built
+from the network in 1.1 s then 3 ms; **8 concurrent cold requests for `/16/12358/25716.glb` →
+one build** (single `built` line in the log, all 8 got 200); a three.js page on a second origin
+loaded the z16 block straight from the server (CORS).
+
+---
+
+## 7. Explicitly deferred (not in these milestones)
+
+- Output-cache eviction / size limits; metrics endpoint; request compression.
+- A built-in browser viewer route (candidate for milestone 5).
 - Antimeridian wrap for neighbour lookup.
 - Fixing cracks at a provider's coverage boundary (§5.1 watertightness statement).
 - TTL / automatic expiry for `.404` markers.

@@ -110,6 +110,12 @@ pub struct Server {
 
 impl Server {
     pub fn start(routes: Vec<(String, Vec<u8>)>) -> Self {
+        Self::start_with_delay(routes, std::time::Duration::ZERO)
+    }
+
+    /// Like `start`, but every matched route sleeps `delay` before answering
+    /// (lets concurrent requests pile up on one build).
+    pub fn start_with_delay(routes: Vec<(String, Vec<u8>)>, delay: std::time::Duration) -> Self {
         let server = std::sync::Arc::new(tiny_http::Server::http("127.0.0.1:0").unwrap());
         let base = format!("http://{}", server.server_addr());
         let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -119,9 +125,11 @@ impl Server {
                 let url = req.url().to_string();
                 h.lock().unwrap().push(url.clone());
                 match routes.iter().find(|(p, _)| *p == url) {
-                    Some((_, body)) => req
-                        .respond(tiny_http::Response::from_data(body.clone()))
-                        .ok(),
+                    Some((_, body)) => {
+                        std::thread::sleep(delay);
+                        req.respond(tiny_http::Response::from_data(body.clone()))
+                            .ok()
+                    }
                     None => req.respond(tiny_http::Response::empty(404)).ok(),
                 };
             }

@@ -4,8 +4,8 @@
 //! Mapzen Terrarium heightmaps and satellite imagery, at 1:1 world scale,
 //! addressed by slippy-map `zoom/x/y`.
 //!
-//! The library is the builder; the `open-tiles` binary is a CLI over it and
-//! the future HTTP server will be another client of the same entry point.
+//! The library is the builder plus the HTTP server ([`server`]); the
+//! `open-tiles` binary wraps both (`build`, `serve`, `lookup`, `refresh-404`).
 //!
 //! ## Conventions
 //!
@@ -44,6 +44,7 @@ pub mod glb;
 pub mod imagery;
 pub mod mesh;
 pub mod provider;
+pub mod server;
 pub mod terrain;
 pub mod tile;
 

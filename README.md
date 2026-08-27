@@ -6,8 +6,33 @@ On-demand **3D terrain tiles as GLB**, at 1:1 world scale, addressed like a slip
 Esri imagery — but with the heights baked into real geometry, so any glTF loader can show the
 terrain without a custom shader.
 
-Status: **milestones 1–3** (builder library + CLI, any zoom 1–22). The HTTP server is next;
-see `outline.md` / `detailed.md`.
+Status: **milestones 1–4** — builder library, CLI, any zoom 1–22, HTTP server. See
+`outline.md` / `detailed.md`.
+
+## Server
+
+```sh
+target/release/open-tiles serve --bind 0.0.0.0:8080 --cache-dir .cache -v
+curl -I http://127.0.0.1:8080/12/772/1607.glb
+#   HTTP/1.1 200 OK
+#   content-type: model/gltf-binary
+#   cache-control: public, max-age=31536000, immutable
+#   etag: "<fingerprint>-548760"
+#   access-control-allow-origin: *
+```
+
+- `GET /{z}/{x}/{y}.glb` — built on first request, then served from
+  `{cache_dir}/glb/{fingerprint}/z/x/y.glb`. The *fingerprint* hashes everything that changes the
+  bytes (version, resolution table, provider URLs and zoom hints, JPEG quality), so a config
+  change never serves stale geometry — old fingerprint directories can simply be deleted.
+- Concurrent requests for one tile share a single build; `--max-builds` (default: CPU count)
+  bounds parallel builds. No broker — one process, in-memory dedup.
+- `If-None-Match` → `304`; `HEAD` supported; `400` invalid tile; `404` nothing upstream at any
+  zoom (`max-age=3600`); `502` upstream failure; `500` decode/I/O. JSON error bodies.
+- CORS `*` by default (`--no-cors`). `GET /` returns name, version, fingerprint, URL template,
+  resolution table, conventions and attribution; `GET /healthz` → `ok`.
+- Provider flags (`--texture-url`, `--heightmap-url`, `--texture-max-zoom`,
+  `--heightmap-max-zoom`, `--timeout`) work as for `build`.
 
 ## CLI
 
