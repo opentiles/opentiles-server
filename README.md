@@ -6,8 +6,8 @@ On-demand **3D terrain tiles as GLB**, at 1:1 world scale, addressed like a slip
 Esri imagery — but with the heights baked into real geometry, so any glTF loader can show the
 terrain without a custom shader.
 
-Status: **milestones 1–2** (builder library + CLI). The HTTP server and zoom > 15 synthesis
-are next; see `outline.md` / `detailed.md`.
+Status: **milestones 1–3** (builder library + CLI, any zoom 1–22). The HTTP server is next;
+see `outline.md` / `detailed.md`.
 
 ## CLI
 
@@ -22,7 +22,13 @@ target/release/open-tiles lookup 36.1 -112.1 12
 
 # build it (downloads into .cache/, reuses on the next run)
 target/release/open-tiles build 12 772 1607 -v
-#   12-772-1607.glb (556021 bytes)
+#   12-772-1607.glb (548760 bytes)
+
+# any zoom works; what the providers don't serve is derived from the closest lower zoom
+target/release/open-tiles build 20 790547 411413 -v
+#   INFO  heightmap 20/…: derived from zoom 15 (15/24704/12856)
+#   INFO  imagery 20/…: derived from zoom 19 (19/395273/205706)
+#   20-790547-411413.glb (7036 bytes)
 ```
 
 Options for `build`:
@@ -31,13 +37,48 @@ Options for `build`:
 |---|---|---|
 | `-o, --output <path>` | `./{zoom}-{x}-{y}.glb` | where to write |
 | `--cache-dir <dir>` | `.cache` | input cache, layout-compatible with raytiles/bevytiles |
-| `--resolution <n>` | `129` | vertices per edge (2..=257; 257 is lossless w.r.t. the 256-texel source) |
+| `--resolution <n>` | per-zoom table (below) | vertices per edge for this zoom (2..=257) |
 | `--texture-url`, `--heightmap-url` | Esri / AWS Terrarium | provider templates with `:zoom:` `:x:` `:y:` tokens |
+| `--texture-max-zoom`, `--heightmap-max-zoom` | `19` / `15` | deepest zoom to *ask* the provider for; deeper tiles derive from there |
 | `--timeout <s>` | `10` | HTTP read timeout |
-| `-v` / `-vv` | | log fetches and timings |
+| `-v` / `-vv` | | log fetches, fallbacks and timings |
 
-Exit codes: `0` ok · `2` usage / invalid tile / above native zoom · `3` upstream 404 · `4` network,
-decode or I/O failure.
+Exit codes: `0` ok · `2` usage / invalid tile / bad resolution · `3` nothing upstream at any
+zoom · `4` network, decode or I/O failure.
+
+`open-tiles refresh-404 [--zoom N] [--kind texture|heightmap]` forgets remembered 404s (see
+"Fallback" below).
+
+## Fallback: any zoom, from whatever the providers have
+
+Terrarium heightmaps stop at z15; Esri imagery at z19 nearly everywhere. A request at any zoom
+starts at `min(zoom, hint)` and, on 404, walks down to the closest lower zoom that exists:
+
+- **heights** — the tile becomes a *window* into its ancestor's padded height field: one
+  bilinear interpolation from source texels to vertices, no intermediate image, no cracks at
+  ancestor boundaries. Nothing is written to disk.
+- **imagery** — the ancestor's image is cropped to the tile's sub-square and upscaled to 256².
+- A provider 404 leaves a zero-byte `{y}.png.404` marker in the cache so the walk never repeats
+  a known-missing request; `refresh-404` deletes markers.
+- `extras.terrain_source_zoom` / `extras.imagery_source_zoom` record what was used.
+
+Watertightness holds between neighbours whose heightmaps resolve to the same source zoom. At a
+provider's coverage boundary (one tile at z, its neighbour only at z−1) a crack of up to one
+z−1 texel's gradient is possible — that is the dataset's edge.
+
+## Resolution per zoom
+
+Vertex spacing tracks the data: every tile carries 256 source texels while its metre size halves
+per zoom. Defaults (vertices per edge), overridable with `--resolution` for a zoom:
+
+| zoom | 1–7 | 8–15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 |
+|---|---|---|---|---|---|---|---|---|---|
+| vertices/edge | 257 | 129 | 129 | 65 | 33 | 17 | 9 | 5 | 3 |
+| raw mesh | 2.9 MB | 0.5 MB | 0.5 MB | 0.13 MB | 33 KB | 9 KB | 2.5 KB | <1 KB | <1 KB |
+
+Whatever zoom the heights really came from, the value is capped at `(256 >> dz) + 1` — beyond
+that a grid only interpolates. `extras.resolution` records the value used
+(`resolution_requested` when capped).
 
 ## What's in a tile
 
@@ -52,7 +93,7 @@ decode or I/O failure.
 - Same-zoom neighbours are watertight: boundary vertices are sampled over a height field padded
   with the neighbours' edge texels, so both tiles compute the identical value.
 - Root `extras`: `zoom, x, y, tile_size_m, bounds{north,south,west,east}, resolution,
-  native_terrain, sources{imagery, elevation}`.
+  resolution_requested?, terrain_source_zoom, imagery_source_zoom, sources{imagery, elevation}`.
 
 ## Library
 
@@ -62,9 +103,9 @@ use open_tiles::{build_tile, Config, TileId};
 let glb = build_tile(&Config::default(), TileId::new(12, 772, 1607)?)?;
 ```
 
-`Config` mirrors the engines' `NetworkConfig` (cache dir, provider URL templates, timeouts) plus
-`resolution`. `load_inputs` exposes the decoded, padded height field and imagery without
-building the GLB.
+`Config` mirrors the engines' `NetworkConfig` (cache dir, provider URL templates + zoom hints,
+timeouts) plus the per-zoom `resolution` table. `load_inputs` exposes the windowed height field,
+imagery and the source tiles without building the GLB.
 
 ## Tests
 

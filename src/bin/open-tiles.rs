@@ -1,11 +1,13 @@
-//! `open-tiles` CLI: build one terrain tile as a GLB, or look up which tile
-//! covers a coordinate.
+//! `open-tiles` CLI: build one terrain tile as a GLB, look up which tile
+//! covers a coordinate, or clear negative-cache markers.
 //!
-//! Exit codes: 0 ok · 2 usage / invalid tile · 3 upstream 404 · 4 network,
-//! decode or I/O failure.
+//! Exit codes: 0 ok · 2 usage / invalid tile · 3 nothing upstream at any
+//! zoom · 4 network, decode or I/O failure.
 
 use anyhow::Context;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use open_tiles::fetch::Fetcher;
+use open_tiles::provider::Kind;
 use open_tiles::{build_tile, Config, Error, TileId};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,11 +32,14 @@ enum Cmd {
     Build(BuildArgs),
     /// Print the tile covering a lat/lon at a zoom, with its bounds and size.
     Lookup(LookupArgs),
+    /// Forget cached 404s so the providers are asked again.
+    #[command(name = "refresh-404")]
+    Refresh404(RefreshArgs),
 }
 
 #[derive(Args)]
 struct BuildArgs {
-    /// Zoom level (1..=22; heightmaps are native up to 15).
+    /// Zoom level (1..=22).
     zoom: u8,
     /// Tile column (west → east).
     x: u32,
@@ -46,15 +51,22 @@ struct BuildArgs {
     /// Input cache root, shareable with raytiles / bevytiles.
     #[arg(long, default_value = ".cache")]
     cache_dir: PathBuf,
-    /// Vertices per edge of the mesh (2..=257).
-    #[arg(long, default_value_t = open_tiles::mesh::DEFAULT_RESOLUTION)]
-    resolution: u32,
+    /// Vertices per edge for this zoom (2..=257); default comes from the
+    /// per-zoom table and is capped by the height source's useful ceiling.
+    #[arg(long)]
+    resolution: Option<u32>,
     /// Imagery URL template (:zoom:/:x:/:y: tokens).
     #[arg(long)]
     texture_url: Option<String>,
     /// Heightmap URL template (:zoom:/:x:/:y: tokens).
     #[arg(long)]
     heightmap_url: Option<String>,
+    /// Deepest zoom to ask the imagery provider for before deriving (default 19).
+    #[arg(long)]
+    texture_max_zoom: Option<u8>,
+    /// Deepest zoom to ask the heightmap provider for before deriving (default 15).
+    #[arg(long)]
+    heightmap_max_zoom: Option<u8>,
     /// HTTP read timeout in seconds.
     #[arg(long, default_value_t = 10)]
     timeout: u64,
@@ -72,12 +84,32 @@ struct LookupArgs {
     zoom: u8,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum AssetKind {
+    Texture,
+    Heightmap,
+}
+
+#[derive(Args)]
+struct RefreshArgs {
+    /// Input cache root.
+    #[arg(long, default_value = ".cache")]
+    cache_dir: PathBuf,
+    /// Only this zoom (default: all).
+    #[arg(long)]
+    zoom: Option<u8>,
+    /// Only this asset kind (default: both).
+    #[arg(long, value_enum)]
+    kind: Option<AssetKind>,
+}
+
 fn main() {
     let cli = Cli::parse();
     init_logger(cli.verbose);
     let code = match cli.cmd {
         Cmd::Build(a) => run_build(a),
         Cmd::Lookup(a) => run_lookup(a),
+        Cmd::Refresh404(a) => run_refresh(a),
     };
     std::process::exit(code);
 }
@@ -89,15 +121,23 @@ fn run_build(a: BuildArgs) -> i32 {
     };
     let mut cfg = Config {
         cache_dir: a.cache_dir,
-        resolution: a.resolution,
         read_timeout: Duration::from_secs(a.timeout),
         ..Config::default()
     };
+    if let Some(r) = a.resolution {
+        cfg.set_resolution(tile.zoom, r);
+    }
     if let Some(u) = a.texture_url {
         cfg.provider.texture_url = u;
     }
     if let Some(u) = a.heightmap_url {
         cfg.provider.heightmap_url = u;
+    }
+    if let Some(z) = a.texture_max_zoom {
+        cfg.provider.texture_max_zoom = z;
+    }
+    if let Some(z) = a.heightmap_max_zoom {
+        cfg.provider.heightmap_max_zoom = z;
     }
     let output = a
         .output
@@ -105,11 +145,9 @@ fn run_build(a: BuildArgs) -> i32 {
 
     let glb = match build_tile(&cfg, tile) {
         Ok(b) => b,
-        Err(
-            e @ (Error::InvalidTile(_)
-            | Error::InvalidResolution(_)
-            | Error::AboveNativeZoom { .. }),
-        ) => return fail(2, &e.into()),
+        Err(e @ (Error::InvalidTile(_) | Error::InvalidResolution(_))) => {
+            return fail(2, &e.into())
+        }
         Err(e @ Error::NotFound { .. }) => return fail(3, &e.into()),
         Err(e) => return fail(4, &e.into()),
     };
@@ -139,6 +177,21 @@ fn run_lookup(a: LookupArgs) -> i32 {
         tile.zoom, tile.x, tile.y
     );
     0
+}
+
+fn run_refresh(a: RefreshArgs) -> i32 {
+    let f = Fetcher::new(&a.cache_dir, Duration::from_secs(1), Duration::from_secs(1));
+    let kind = a.kind.map(|k| match k {
+        AssetKind::Texture => Kind::Texture,
+        AssetKind::Heightmap => Kind::Heightmap,
+    });
+    match f.clear_missing_markers(kind, a.zoom) {
+        Ok(n) => {
+            println!("removed {n} markers");
+            0
+        }
+        Err(e) => fail(4, &e.into()),
+    }
 }
 
 fn fail(code: i32, e: &anyhow::Error) -> i32 {

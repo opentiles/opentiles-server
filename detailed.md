@@ -1,9 +1,9 @@
 # OPEN-TILES — Detailed Plan: Milestones 1 & 2
 
-> Covers **Milestone 1 (builder core)** and **Milestone 2 (CLI)** from `outline.md`.
-> Milestones 3–5 (greater zoom, server, consumer proof) are out of scope here.
+> Covers **Milestone 1 (builder core)**, **Milestone 2 (CLI)** and **Milestone 3 (greater
+> zoom)** from `outline.md`. Milestones 4–5 (server, consumer proof) are out of scope here.
 > §0 records the decisions taken on this plan (2026-08-28).
-> **Status (2026-08-28): milestones 1 and 2 implemented** — `cargo test` (34 tests, offline)
+> **Status (2026-08-28): milestones 1, 2 and 3 implemented** (§5 acceptance recorded at its end) — `cargo test` (34 tests, offline)
 > green, clippy/fmt clean, 3×3 Grand Canyon block at z12 validated (official glTF validator:
 > 0 errors/warnings on all 9 files) and inspected in a three.js viewer — watertight seams,
 > imagery aligned with relief, Y range 707–2 489 m. Deviations from the plan are marked **[impl]**.
@@ -91,8 +91,8 @@ flag. The material is a plain `pbrMetallicRoughness` with the imagery as `baseCo
   and sniff the format — we do the same so caches are interchangeable with raytiles/bevytiles).
 - **Provider URL templates** with `:zoom:`, `:x:`, `:y:` tokens; Esri's default is `zoom/y/x`
   order on purpose. Defaults identical to the engines' `NetworkConfig`.
-- **Native terrain zoom = 15.** In milestones 1–2 a request above 15 is rejected with a clear
-  error; synthesis arrives in milestone 3.
+- **No native-zoom concept.** Milestones 1–2 reject heightmap requests above 15; milestone 3
+  (§5) replaces that with "closest provided zoom" fallback for every asset at every zoom.
 
 ---
 
@@ -294,10 +294,173 @@ and in wireframe across the row boundary.
 
 ---
 
-## 5. Explicitly deferred (not in these two milestones)
+## 5. Milestone 3 — Any zoom: fall back to the closest provided zoom
 
-- Heightmap synthesis above z15 and lineage backfill (milestone 3).
+Goal: `open-tiles build <z> <x> <y>` works for every `z ∈ [1, 22]` regardless of what the
+providers actually serve there. Decided 2026-08-28: **there is no "native zoom" concept.** Each
+provider has a *most-provided zoom* hint; a request at any zoom starts at
+`min(zoom, hint)` and, on 404, walks down to the closest lower zoom that exists. The tile is then
+derived from that ancestor — heights by windowed sampling (§5.0.1 A, approved), imagery by
+crop-and-upscale. This applies uniformly to heightmaps and imagery, and to the tile's neighbours.
+
+### 5.0 Decisions
+
+#### 5.0.1 Heights: sample the ancestor's field directly — **approved (A)**
+
+Build the ancestor's padded 258×258 field (the milestone-1 structure) and give the derived tile a
+*window* into it: `u_src = (qx + u) / 2^dz`. One bilinear interpolation from source to vertex,
+no intermediate image, no clamp at ancestor edges, nothing written to disk. Derived heightmap PNGs
+an engine may have left in a shared `.cache/` are ignored. The engines' `upsample_quadrant` /
+`encode_terrarium` are not ported (a reference copy lives in a test to pin interior equivalence).
+
+#### 5.0.2 Per-zoom mesh resolution table — **approved as proposed** (implementation started on "start impl")
+
+Principle: **vertex spacing tracks the data**, and the data per tile is fixed at 256 texels
+while the tile's metre size halves per zoom. So resolution should be *high at low zoom* (huge
+tiles, few of them, full source fidelity is cheap in aggregate) and *decrease at high zoom*,
+where a tile covers only a fraction of a source texel grid. Proposed defaults, vertices per edge:
+
+| zoom | default | vertices | indices | raw mesh | rationale |
+|---|---|---|---|---|---|
+| 1–7 | **257** | 66 049 | u32 | ≈ 2.9 MB | continental tiles (≥ 300 km edge): ≤ 16 k tiles exist at z7; use every source texel |
+| 8–15 | **129** | 16 641 | u16 | ≈ 0.5 MB | the streaming range (150 km → 1 km edge): 2 source texels per vertex — the size/quality point already chosen in §0.3 |
+| 16 | 129 | 16 641 | u16 | ≈ 0.5 MB | ceiling: a z16 tile covers 128 source texels (source at z15) |
+| 17 | 65 | 4 225 | u16 | ≈ 0.13 MB | covers 64 texels |
+| 18 | 33 | 1 089 | u16 | ≈ 33 KB | 32 texels |
+| 19 | 17 | 289 | u16 | ≈ 9 KB | 16 texels |
+| 20 | 9 | 81 | u16 | ≈ 2.5 KB | 8 texels |
+| 21 | 5 | 25 | u16 | < 1 KB | 4 texels |
+| 22 | 3 | 9 | u16 | < 1 KB | 2 texels — a bilinear patch |
+
+Rules on top of the table:
+
+- **Ceiling by actual source**: whichever zoom the heightmap really came from (`z_src`, after
+  fallback), the effective resolution is `min(table[z], (256 >> (z − z_src)) + 1)`. The table
+  above already equals that ceiling for z ≥ 16 when Terrarium serves z15; if Terrarium 404s and
+  the source is z14, a z16 tile automatically drops to 65.
+- `--resolution <n>` overrides the table for the requested zoom (still subject to the ceiling);
+  `Config.resolution: [u32; 22]` holds the table for library users.
+- `extras.resolution` records the value used; `extras.resolution_requested` appears when the
+  ceiling clamped it.
+
+If you'd rather keep 257 deeper (say through z11 — 20 km tiles, 3 MB each) or 129 shallower,
+change the two boundaries; everything else follows from the ceiling rule.
+
+#### 5.0.3 Imagery: derive from the closest lower zoom — **approved**
+
+On 404 at the requested zoom, walk down; take the ancestor image, crop the `256 / 2^dz` texel
+sub-window the tile covers, upscale to 256×256 (bilinear — ancestor imagery is already the best
+data there is; sharper filters only invent edges), encode JPEG. `extras.imagery_source_zoom`
+records the zoom used. Imagery has no seam problem (it's a texture, not geometry) so no neighbour
+handling is needed.
+
+#### 5.0.4 Negative cache — needed to make fallback affordable
+
+Without it, building a z22 tile means 7 heightmap 404s (z22→z15) every time, and every
+neighbour repeats them. Decision: on 404, write a zero-byte **`{path}.404`** marker next to the
+would-be cache entry; `fetch` treats a marker as an instant 404. Markers have no TTL in v1
+(providers gain coverage rarely); a `--refresh-404` flag deletes markers under a zoom prefix.
+Markers are open-tiles-only files; the engines ignore unknown files in the cache tree.
+
+#### 5.0.5 Provider hints (was "native zoom")
+
+`Provider` gets `heightmap_max_zoom: u8` (default **15**, Terrarium) and `texture_max_zoom: u8`
+(default **19**, Esri — it goes deeper in cities, but 19 is the everywhere-safe start point;
+tiles above it are derived unless a `--texture-max-zoom` override says to try). They are **start
+points for the walk-down, not limits**: a 404 below the hint keeps walking; the hint only avoids
+requests that are known to fail. `native_terrain_zoom` is removed.
+
+### 5.1 Conventions added
+
+- Ancestor of `(z, x, y)` at zoom `s < z`: `dz = z − s`, `(s, x >> dz, y >> dz)`; window offset
+  inside it `qx = x − (ax << dz)`, `qy = y − (ay << dz)` in `[0, 2^dz)`; window scale `1/2^dz`.
+- Height sampling for a derived tile: `(u, v) ↦ ((qx + u)/2^dz, (qy + v)/2^dz)` in the ancestor's
+  padded field. The pad ring comes from the ancestor's 8 neighbours *at the ancestor's zoom*;
+  a neighbour that 404s there → that side clamps (v1; see the watertightness statement).
+- **Watertightness guarantee** (honest statement): two adjacent tiles at the same zoom whose
+  heightmaps resolve to the **same source zoom** share an edge exactly. At a provider's coverage
+  boundary (tile A resolves at z, its neighbour B only at z−1) the edge can crack by up to one
+  z−1 texel's gradient — the dataset edge itself. Not fixed in v1; documented in README.
+- `extras`: `terrain_source_zoom`, `imagery_source_zoom`, `resolution`, optional
+  `resolution_requested`; `native_terrain` is replaced by `terrain_source_zoom == zoom`.
+
+### 5.2 Steps
+
+#### Step 3.1 — `fetch.rs`: negative cache + walk-down
+- `fetch` honours `{path}.404` (instant `NotFound`) and writes it on HTTP 404.
+- `fetch_closest(kind, tile, start_zoom) -> (bytes, source: TileId)`: for `z` from
+  `min(tile.zoom, start_zoom)` down to 1, try the ancestor at `z`; return the first hit. A network
+  error (non-404) at any level aborts (transient errors never silently change which zoom a tile
+  is derived from — same rule as neighbours today).
+- Tests (local server): 404 at z16 + hit at z15 → returns z15 bytes and `12/…` source; marker
+  written; second call makes no request at z16; a 500 at z16 → `Fetch` error, no marker.
+
+#### Step 3.2 — `terrain.rs`: windowed field
+- `HeightField { data: Arc<[f32]>, size, window: Window { u0, v0, scale } }`; `sample` maps
+  through the window; `HeightField::windowed(&self, dz, qx, qy)` derives a child view.
+- Tests: NW z16 child at `(1, 1)` = ancestor at `(0.5, 0.5)`; two z17 tiles across a z15
+  boundary agree on the shared edge (two-ancestor ramp fixture); interior texel equals a
+  test-local port of the engines' `upsample_quadrant`.
+
+#### Step 3.3 — `imagery.rs` (new): crop-and-upscale
+- `derive_imagery(ancestor_bytes, dz, qx, qy) -> jpeg`: decode → crop `256>>dz` square at
+  `(qx, qy)·(256>>dz)` → resize to 256² (bilinear / `image::imageops::resize` with `Triangle`)
+  → JPEG at `Config.jpeg_quality`.
+- Tests: dz = 1 crop of a 2×2 checker gives a solid colour; dz = 0 is a byte pass-through;
+  output is 256² JPEG.
+
+#### Step 3.4 — `builder.rs`: routing + resolution table
+- `Config.resolution` becomes `[u32; 22]` (index `zoom − 1`) with the §5.0.2 defaults;
+  `Config::resolution_for(zoom)`; `check_resolution` applies to every entry.
+- `load_inputs`: heightmap via `fetch_closest` with `heightmap_max_zoom`; the 8 neighbours are
+  the *source* tile's neighbours; imagery via `fetch_closest` with `texture_max_zoom` then
+  `derive_imagery` when `dz > 0`. `Error::AboveNativeZoom` is deleted.
+- `build_tile`: effective resolution = ceiling rule; `TileMeta` gains the new extras.
+- Tests: z16 from a seeded z15 cache — no z16 heightmap request, `terrain_source_zoom = 15`,
+  geometry equals direct sub-window sampling; z18 mesh is 33×33; a z12 tile whose imagery
+  404s at z12 but exists at z11 embeds an upscaled crop and reports `imagery_source_zoom = 11`;
+  a tile with nothing at any zoom → exit 3 / `NotFound`.
+
+#### Step 3.5 — CLI & docs
+- `--resolution` (override for this zoom), `--heightmap-max-zoom`, `--texture-max-zoom`,
+  `--refresh-404 <zoom-prefix>`; README: fallback rules, resolution table, the watertightness
+  statement; `detailed.md` status.
+
+#### Step 3.6 — Acceptance
+- Grand Canyon: the 16 z16 tiles under z14 `3090/6428` (spans several z15 ancestors), one z18,
+  one z20, one z22; validator clean on all; viewer wireframe at grazing angles across z15
+  ancestor boundaries — no cracks; z18 = 33×33; z20/z22 imagery derived (blurry but present,
+  `imagery_source_zoom` ≤ 19) rather than exit 3.
+- Low zoom: z3, z5, z7 tiles build at 257 (u32 indices, ≈ 3 MB) and validate.
+- Negative cache: second build of the z22 tile makes zero HTTP requests (`-vv` shows only
+  cache hits and markers).
+
+**Milestone 3 exit criteria:** acceptance passes; `cargo test` green offline; no derived
+heightmap or imagery files are written under `.cache/` (only native entries and `.404` markers).
+
+**Implementation notes [impl]:** `refresh-404` is a subcommand (`open-tiles refresh-404
+[--zoom] [--kind]`), not a `build` flag. `Config.resolution` is `[u32; 22]` with
+`resolution_for` / `set_resolution` / `with_uniform_resolution`. `HeightField` shares its data
+via `Arc` and composes windows (`windowed(dz, qx, qy)`). `native_terrain` in `extras` is
+replaced by `terrain_source_zoom` + `imagery_source_zoom`. 47 tests, offline.
+
+**Acceptance run (2026-08-28):** 16 z16 tiles under z14 `3090/6429` (Grand Canyon, x 12360–12363,
+y 25716–25719; spans four z15 ancestors), z18 `49445/102870` (heights z15, imagery native z18,
+33×33), z20 (heights z15, imagery z19, 9×9), z22 (imagery z19, 3×3), z3/z5/z7 (257², ≈2.9 MB
+each): `gltf-validator` 0 errors/warnings on every file; second build of the z22 tile made zero
+downloads; no files under `heightmap/16+`; three.js viewer of the z16 block: continuous textured
+surface and an unbroken wireframe across the z15 ancestor boundaries. (A first run of this block
+was accidentally built at tile numbers shifted to 91°E — Tibet, ~5 000 m — which also validated
+clean and derived correctly; discarded for the record.) Sea-level check (Ziv's suggestion): a
+3×3 z14 block on the Tel Aviv shoreline — the all-water tile `14/9773/6648` has Y −0.0…0.1 m
+and the coast sits exactly on a Y = 0 reference grid in the viewer; land tiles rise to 50–150 m.
+
+---
+
+## 6. Explicitly deferred (not in these milestones)
+
 - HTTP server, output cache, in-flight dedup (milestone 4).
 - Antimeridian wrap for neighbour lookup.
-- Texture upsampling from deeper-zoom imagery.
+- Fixing cracks at a provider's coverage boundary (§5.1 watertightness statement).
+- TTL / automatic expiry for `.404` markers.
 - Mesh compression / quantisation extensions; lighting extensions (`KHR_materials_unlit`).

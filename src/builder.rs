@@ -1,13 +1,14 @@
-//! The one entry point: fetch inputs → decode → grid → GLB.
+//! The one entry point: fetch inputs (falling back to the closest provided
+//! zoom) → decode → grid → GLB.
 
-use crate::fetch::{Fetcher, Origin};
+use crate::fetch::{Closest, Fetcher, Origin};
 use crate::glb::{write_glb, TileMeta};
-use crate::mesh::{build_grid, check_resolution, DEFAULT_RESOLUTION};
+use crate::imagery;
+use crate::mesh::{build_grid, check_resolution, useful_ceiling, ZOOM_LEVELS};
 use crate::provider::{Kind, Provider};
 use crate::terrain::{decode_heightmap_png, HeightField};
-use crate::tile::TileId;
+use crate::tile::{TileId, MIN_ZOOM};
 use crate::{Error, Result};
-use std::io::Cursor;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -19,13 +20,18 @@ pub struct Config {
     pub cache_dir: PathBuf,
     /// Where inputs come from.
     pub provider: Provider,
-    /// Vertices per edge of the output grid, `2..=257`.
-    pub resolution: u32,
+    /// Vertices per edge of the output grid per zoom, indexed
+    /// `zoom - MIN_ZOOM`; each entry in `2..=257`. See
+    /// [`DEFAULT_RESOLUTIONS`](crate::mesh::DEFAULT_RESOLUTIONS). The value
+    /// actually used is further capped by the useful ceiling when the
+    /// heightmap came from a lower zoom.
+    pub resolution: [u32; ZOOM_LEVELS],
     /// HTTP connect timeout.
     pub connect_timeout: Duration,
     /// HTTP read timeout.
     pub read_timeout: Duration,
-    /// JPEG quality used only when the imagery provider returned PNG.
+    /// JPEG quality used when imagery has to be encoded (PNG input, or
+    /// derived from an ancestor).
     pub jpeg_quality: u8,
 }
 
@@ -34,7 +40,7 @@ impl Default for Config {
         Self {
             cache_dir: PathBuf::from(".cache"),
             provider: Provider::default(),
-            resolution: DEFAULT_RESOLUTION,
+            resolution: crate::mesh::DEFAULT_RESOLUTIONS,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(10),
             jpeg_quality: 90,
@@ -42,47 +48,81 @@ impl Default for Config {
     }
 }
 
-/// Decoded inputs for one tile — what milestone 1 produces.
+impl Config {
+    /// The configured resolution for `zoom`.
+    pub fn resolution_for(&self, zoom: u8) -> u32 {
+        self.resolution[(zoom.clamp(MIN_ZOOM, crate::tile::MAX_ZOOM) - MIN_ZOOM) as usize]
+    }
+
+    /// Override the resolution for one zoom.
+    pub fn set_resolution(&mut self, zoom: u8, vertices_per_edge: u32) {
+        self.resolution[(zoom.clamp(MIN_ZOOM, crate::tile::MAX_ZOOM) - MIN_ZOOM) as usize] =
+            vertices_per_edge;
+    }
+
+    /// Same table as the defaults but with every entry replaced — handy for
+    /// "everything at N".
+    pub fn with_uniform_resolution(mut self, vertices_per_edge: u32) -> Self {
+        self.resolution = [vertices_per_edge; ZOOM_LEVELS];
+        self
+    }
+}
+
+/// Decoded inputs for one tile.
 pub struct TileInputs {
     /// The tile.
     pub tile: TileId,
-    /// Padded height field (tile + neighbour ring), metres.
+    /// Height field (source tile + neighbour ring) windowed onto `tile`.
     pub height: HeightField,
-    /// Imagery as a JPEG stream (pass-through, or re-encoded from PNG).
+    /// The tile the heightmap actually came from (`== tile` or an ancestor).
+    pub terrain_source: TileId,
+    /// Imagery as a JPEG stream for `tile` (pass-through, re-encoded, or
+    /// derived from `imagery_source`).
     pub jpeg: Vec<u8>,
-    /// How many of the 8 neighbours contributed a pad ring.
+    /// The tile the imagery came from (`== tile` or an ancestor).
+    pub imagery_source: TileId,
+    /// How many of the source tile's 8 neighbours contributed a pad ring.
     pub neighbours_present: usize,
 }
 
-/// Fetch and decode everything the mesh needs. Neighbour heightmaps are
-/// fetched concurrently; a neighbour that 404s is treated as the dataset
-/// edge (its side clamps), any other neighbour failure fails the build —
-/// a transient error must not silently produce a different mesh that then
-/// gets cached as the tile.
+/// Fetch and decode everything the mesh needs.
+///
+/// Heightmap and imagery each resolve to the closest provided zoom
+/// ([`Fetcher::fetch_closest`]). The pad ring is built from the *source*
+/// tile's 8 neighbours at the source zoom, fetched concurrently: a neighbour
+/// that 404s there is treated as the dataset edge (its side clamps); any
+/// other neighbour failure fails the build — a transient error must not
+/// silently produce a different mesh that then gets cached as the tile.
 pub fn load_inputs(cfg: &Config, tile: TileId) -> Result<TileInputs> {
-    let native = cfg.provider.native_terrain_zoom;
-    if tile.zoom > native {
-        return Err(Error::AboveNativeZoom {
-            zoom: tile.zoom,
-            native,
-        });
-    }
     let fetcher = Fetcher::new(&cfg.cache_dir, cfg.connect_timeout, cfg.read_timeout);
     let fetcher = &fetcher;
-    let neighbours = tile.neighbours();
 
-    // centre heightmap + imagery + 8 neighbours, all in flight together
-    let (centre, imagery, ring) = std::thread::scope(|s| {
-        let centre = s.spawn(move || fetch_heightmap(fetcher, &cfg.provider, tile, "heightmap"));
+    // resolve the height source first: the neighbour set depends on it
+    let (imagery, height_src) = std::thread::scope(|s| {
         let imagery = s.spawn(move || fetch_imagery(fetcher, cfg, tile));
-        let ring: Vec<_> = neighbours
+        let height = fetch_closest_logged(fetcher, &cfg.provider, Kind::Heightmap, tile);
+        (imagery.join().expect("fetch thread panicked"), height)
+    });
+    let height_src = height_src?;
+    let (jpeg, imagery_source) = imagery?;
+    let source = height_src.source;
+    let centre = decode_heightmap_png(&height_src.bytes, &format!("heightmap {source}"))?;
+
+    let neighbours = source.neighbours();
+    let ring: Vec<Result<Option<Vec<f32>>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = neighbours
             .iter()
             .map(|n| {
                 s.spawn(move || match n {
                     None => Ok(None),
                     Some(t) => {
-                        match fetch_heightmap(fetcher, &cfg.provider, *t, "neighbour heightmap") {
-                            Ok(h) => Ok(Some(h)),
+                        let url = cfg.provider.url(Kind::Heightmap, *t);
+                        match fetcher.fetch(Kind::Heightmap, *t, &url) {
+                            Ok((bytes, origin)) => {
+                                log_fetch("neighbour heightmap", *t, origin, bytes.len());
+                                decode_heightmap_png(&bytes, &format!("neighbour heightmap {t}"))
+                                    .map(Some)
+                            }
                             Err(Error::NotFound { url }) => {
                                 log::info!("neighbour {t} not found ({url}); clamping that edge");
                                 Ok(None)
@@ -93,54 +133,69 @@ pub fn load_inputs(cfg: &Config, tile: TileId) -> Result<TileInputs> {
                 })
             })
             .collect();
-        let ring: Vec<Result<Option<Vec<f32>>>> = ring
+        handles
             .into_iter()
             .map(|h| h.join().expect("fetch thread panicked"))
-            .collect();
-        (
-            centre.join().expect("fetch thread panicked"),
-            imagery.join().expect("fetch thread panicked"),
-            ring,
-        )
+            .collect()
     });
 
-    let centre = centre?;
-    let jpeg = imagery?;
     let mut sides: [Option<Vec<f32>>; 8] = Default::default();
     for (slot, r) in sides.iter_mut().zip(ring) {
         *slot = r?;
     }
     let neighbours_present = sides.iter().filter(|s| s.is_some()).count();
-    let height = HeightField::padded(&centre, &sides);
+    let field = HeightField::padded(&centre, &sides);
+    let (_, qx, qy) = tile.ancestor(source.zoom);
+    let height = field.windowed(tile.zoom - source.zoom, qx, qy);
     Ok(TileInputs {
         tile,
         height,
+        terrain_source: source,
         jpeg,
+        imagery_source,
         neighbours_present,
     })
 }
 
 /// Build the finished GLB for `tile`.
 pub fn build_tile(cfg: &Config, tile: TileId) -> Result<Vec<u8>> {
-    check_resolution(cfg.resolution)?;
+    for r in cfg.resolution {
+        check_resolution(r)?;
+    }
     let t0 = Instant::now();
     let inputs = load_inputs(cfg, tile)?;
     let t1 = Instant::now();
-    let grid = build_grid(&inputs.height, tile.size_m(), cfg.resolution)?;
+
+    let requested = cfg.resolution_for(tile.zoom);
+    let ceiling = useful_ceiling(tile.zoom - inputs.terrain_source.zoom);
+    let resolution = requested.min(ceiling);
+    if resolution < requested {
+        log::info!(
+            "{tile}: resolution {requested} clamped to {resolution} (heights come from zoom {}, {} source texels per edge)",
+            inputs.terrain_source.zoom,
+            ceiling - 1
+        );
+    }
+
+    let grid = build_grid(&inputs.height, tile.size_m(), resolution)?;
     let meta = TileMeta {
         tile,
         tile_size_m: tile.size_m(),
-        resolution: cfg.resolution,
-        native_terrain: true,
+        resolution,
+        resolution_requested: (resolution < requested).then_some(requested),
+        terrain_source_zoom: inputs.terrain_source.zoom,
+        imagery_source_zoom: inputs.imagery_source.zoom,
         imagery_attribution: cfg.provider.imagery_attribution.clone(),
         elevation_attribution: cfg.provider.elevation_attribution.clone(),
     };
     let glb = write_glb(&grid, &inputs.jpeg, &meta);
     log::info!(
-        "built {tile}: {} vertices, {} triangles, {} bytes (inputs {:?}, mesh+glb {:?}, {} neighbours)",
+        "built {tile}: {} vertices, {} triangles, {} bytes (heights z{}, imagery z{}; inputs {:?}, mesh+glb {:?}, {} neighbours)",
         grid.positions.len(),
         grid.triangles(),
         glb.len(),
+        inputs.terrain_source.zoom,
+        inputs.imagery_source.zoom,
         t1 - t0,
         t1.elapsed(),
         inputs.neighbours_present,
@@ -148,50 +203,39 @@ pub fn build_tile(cfg: &Config, tile: TileId) -> Result<Vec<u8>> {
     Ok(glb)
 }
 
-fn fetch_heightmap(
+fn fetch_closest_logged(
     fetcher: &Fetcher,
     provider: &Provider,
+    kind: Kind,
     tile: TileId,
-    what: &str,
-) -> Result<Vec<f32>> {
-    let url = provider.url(Kind::Heightmap, tile);
-    let (bytes, origin) = fetcher.fetch(Kind::Heightmap, tile, &url)?;
-    log_fetch(what, tile, origin, bytes.len());
-    decode_heightmap_png(&bytes, &format!("{what} {tile}"))
+) -> Result<Closest> {
+    let c = fetcher.fetch_closest(provider, kind, tile)?;
+    log_fetch(kind.name(), c.source, c.origin, c.bytes.len());
+    if c.source != tile {
+        log::info!(
+            "{} {tile}: derived from zoom {} ({})",
+            kind.name(),
+            c.source.zoom,
+            c.source
+        );
+    }
+    Ok(c)
 }
 
-/// Imagery bytes as JPEG. Esri serves JPEG under a `.png`-named cache entry;
-/// sniff, pass JPEG through untouched (keeps the build deterministic and
-/// lossless), re-encode anything else.
-fn fetch_imagery(fetcher: &Fetcher, cfg: &Config, tile: TileId) -> Result<Vec<u8>> {
-    let url = cfg.provider.url(Kind::Texture, tile);
-    let (bytes, origin) = fetcher.fetch(Kind::Texture, tile, &url)?;
-    log_fetch("imagery", tile, origin, bytes.len());
-    let format = image::guess_format(&bytes).map_err(|e| Error::Decode {
-        what: format!("imagery {tile}"),
-        reason: e.to_string(),
-    })?;
-    if format == image::ImageFormat::Jpeg {
-        return Ok(bytes);
-    }
-    let img = image::load_from_memory_with_format(&bytes, format)
-        .map_err(|e| Error::Decode {
-            what: format!("imagery {tile}"),
-            reason: e.to_string(),
-        })?
-        .into_rgb8();
-    let mut out = Vec::new();
-    let mut enc =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut out), cfg.jpeg_quality);
-    enc.encode_image(&img).map_err(|e| Error::Decode {
-        what: format!("imagery {tile} (jpeg re-encode)"),
-        reason: e.to_string(),
-    })?;
-    log::debug!(
-        "imagery {tile}: re-encoded {format:?} → jpeg ({} bytes)",
-        out.len()
-    );
-    Ok(out)
+/// Imagery bytes as JPEG for `tile`, from the closest provided zoom.
+fn fetch_imagery(fetcher: &Fetcher, cfg: &Config, tile: TileId) -> Result<(Vec<u8>, TileId)> {
+    let c = fetch_closest_logged(fetcher, &cfg.provider, Kind::Texture, tile)?;
+    let (_, qx, qy) = tile.ancestor(c.source.zoom);
+    let what = format!("imagery {tile}");
+    let jpeg = imagery::derive_from_ancestor(
+        &c.bytes,
+        tile.zoom - c.source.zoom,
+        qx,
+        qy,
+        cfg.jpeg_quality,
+        &what,
+    )?;
+    Ok((jpeg, c.source))
 }
 
 fn log_fetch(what: &str, tile: TileId, origin: Origin, len: usize) {

@@ -121,6 +121,28 @@ impl TileId {
             / self.tiles_per_axis() as f64
     }
 
+    /// The ancestor of this tile at `zoom <= self.zoom`, plus this tile's
+    /// window offset inside it: `(qx, qy)` in `[0, 2^dz)` where
+    /// `dz = self.zoom - zoom`. `zoom == self.zoom` returns the tile itself
+    /// with offset `(0, 0)`.
+    ///
+    /// # Panics
+    /// If `zoom > self.zoom`.
+    pub fn ancestor(&self, zoom: u8) -> (Self, u32, u32) {
+        assert!(
+            zoom <= self.zoom,
+            "ancestor zoom {zoom} above tile zoom {}",
+            self.zoom
+        );
+        let dz = self.zoom - zoom;
+        let a = Self {
+            zoom,
+            x: self.x >> dz,
+            y: self.y >> dz,
+        };
+        (a, self.x - (a.x << dz), self.y - (a.y << dz))
+    }
+
     /// The tile offset by `(dx, dy)` at the same zoom, or `None` if that
     /// leaves the grid. No antimeridian wrap in v1.
     pub fn offset(&self, dx: i32, dy: i32) -> Option<Self> {
@@ -230,6 +252,24 @@ mod tests {
         assert_eq!(n[7], Some(TileId::new(2, 1, 1).unwrap()));
         let m = TileId::new(2, 1, 1).unwrap();
         assert!(m.neighbours().iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn ancestor_and_window() {
+        let t = TileId::new(18, 49_411, 102_865).unwrap();
+        let (a, qx, qy) = t.ancestor(15);
+        assert_eq!(a, TileId::new(15, 6176, 12858).unwrap());
+        assert_eq!((qx, qy), (49_411 - (6176 << 3), 102_865 - (12858 << 3)));
+        assert!(qx < 8 && qy < 8);
+        assert_eq!(t.ancestor(18), (t, 0, 0));
+        // the ancestor's bounds contain the tile's
+        let (tb, ab) = (t.bounds(), a.bounds());
+        assert!(
+            ab.north >= tb.north
+                && ab.south <= tb.south
+                && ab.west <= tb.west
+                && ab.east >= tb.east
+        );
     }
 
     #[test]

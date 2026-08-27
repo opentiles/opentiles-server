@@ -10,12 +10,37 @@
 use crate::terrain::HeightField;
 use crate::{Error, Result};
 
-/// Default vertices per edge (128 quads; 16 641 vertices, u16-indexable).
-pub const DEFAULT_RESOLUTION: u32 = 129;
 /// Smallest useful grid: one quad.
 pub const MIN_RESOLUTION: u32 = 2;
 /// Beyond 257 the grid only interpolates the 256-texel source.
 pub const MAX_RESOLUTION: u32 = 257;
+/// Number of zoom levels covered by a resolution table (`MIN_ZOOM..=MAX_ZOOM`).
+pub const ZOOM_LEVELS: usize = (crate::tile::MAX_ZOOM - crate::tile::MIN_ZOOM + 1) as usize;
+
+/// Default vertices per edge, indexed by `zoom - MIN_ZOOM`. Vertex spacing
+/// tracks the data: every tile carries 256 source texels while its metre
+/// size halves per zoom, so resolution is high for continental tiles (1–7,
+/// full source fidelity), the streaming range 8–15 uses two source texels
+/// per vertex, and above the heightmap provider's deepest zoom (15) each
+/// level covers half as many source texels as the one before.
+pub const DEFAULT_RESOLUTIONS: [u32; ZOOM_LEVELS] = [
+    257, 257, 257, 257, 257, 257, 257, // 1–7
+    129, 129, 129, 129, 129, 129, 129, 129, // 8–15
+    129, 65, 33, 17, 9, 5, 3, // 16–22
+];
+
+/// The table's entry for `zoom` (clamped into the supported range).
+pub fn default_resolution(zoom: u8) -> u32 {
+    let i = zoom.clamp(crate::tile::MIN_ZOOM, crate::tile::MAX_ZOOM) - crate::tile::MIN_ZOOM;
+    DEFAULT_RESOLUTIONS[i as usize]
+}
+
+/// Vertices per edge beyond which a tile `dz` levels below its height source
+/// only interpolates: it covers `256 >> dz` source texels.
+pub fn useful_ceiling(dz: u8) -> u32 {
+    let texels = (crate::terrain::TILE_TEXELS as u32) >> dz.min(31);
+    (texels + 1).max(MIN_RESOLUTION)
+}
 
 /// Flat vertex/index arrays ready for a GLB.
 #[derive(Clone, Debug)]
@@ -127,6 +152,21 @@ mod tests {
         assert_eq!(g.max, [1000.0, 100.0, 1000.0]);
         assert!(g.fits_u16());
         assert!(!build_grid(&flat(0.0), 1.0, 257).unwrap().fits_u16());
+    }
+
+    #[test]
+    fn resolution_table_and_ceiling() {
+        assert_eq!(default_resolution(1), 257);
+        assert_eq!(default_resolution(12), 129);
+        assert_eq!(default_resolution(18), 33);
+        assert_eq!(default_resolution(22), 3);
+        assert_eq!(useful_ceiling(0), 257);
+        assert_eq!(useful_ceiling(3), 33);
+        assert_eq!(useful_ceiling(7), 3);
+        assert_eq!(useful_ceiling(9), 2);
+        for (i, r) in DEFAULT_RESOLUTIONS.iter().enumerate() {
+            assert!(check_resolution(*r).is_ok(), "slot {i}");
+        }
     }
 
     #[test]

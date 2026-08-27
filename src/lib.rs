@@ -21,6 +21,9 @@
 //!   edge texels, so both sides evaluate to the same value.
 //! - No normals, no skirts. Viewers compute flat normals; LOD seams are the
 //!   client's problem.
+//! - Any zoom 1–22. When a provider has nothing at the requested zoom, the
+//!   asset comes from the closest lower zoom that exists: heights by sampling
+//!   a window of the ancestor's field, imagery by crop-and-upscale.
 //!
 //! ## Quick start
 //!
@@ -38,6 +41,7 @@
 pub mod builder;
 pub mod fetch;
 pub mod glb;
+pub mod imagery;
 pub mod mesh;
 pub mod provider;
 pub mod terrain;
@@ -53,17 +57,6 @@ pub enum Error {
     /// Zoom outside `[MIN_ZOOM, MAX_ZOOM]` or `x`/`y` outside `[0, 2^zoom)`.
     #[error("invalid tile: {0}")]
     InvalidTile(String),
-    /// Heightmaps are only served natively up to the provider's ceiling;
-    /// synthesis above it is not implemented yet.
-    #[error(
-        "zoom {zoom} is above the native terrain zoom {native}; synthesis is not implemented yet"
-    )]
-    AboveNativeZoom {
-        /// Requested zoom.
-        zoom: u8,
-        /// The provider's native ceiling.
-        native: u8,
-    },
     /// Invalid mesh resolution (vertices per edge).
     #[error("resolution must be in 2..=257 vertices per edge, got {0}")]
     InvalidResolution(u32),

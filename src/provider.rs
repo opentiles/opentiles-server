@@ -1,6 +1,11 @@
-//! Tile providers: URL templates with `:zoom:` / `:x:` / `:y:` tokens.
-//! Defaults are identical to raytiles / bevytiles so an existing `.cache/`
-//! from either engine is usable as-is.
+//! Tile providers: URL templates with `:zoom:` / `:x:` / `:y:` tokens, plus a
+//! *most-provided zoom* hint per asset. Defaults are identical to raytiles /
+//! bevytiles so an existing `.cache/` from either engine is usable as-is.
+//!
+//! There is no "native zoom" concept: a request at any zoom starts at
+//! `min(zoom, hint)` and walks down on 404 to the closest zoom that exists
+//! (see [`crate::fetch::Fetcher::fetch_closest`]). The hint only avoids
+//! requests known to fail; a 404 below it keeps walking.
 
 use crate::tile::TileId;
 
@@ -12,9 +17,12 @@ pub struct Provider {
     pub texture_url: String,
     /// Terrarium heightmap URL template (`zoom/x/y`).
     pub heightmap_url: String,
-    /// Highest zoom the heightmap provider serves natively (Mapzen: 15).
-    /// Above it heightmaps must be synthesized (milestone 3).
-    pub native_terrain_zoom: u8,
+    /// Deepest zoom the imagery provider serves nearly everywhere (Esri: 19;
+    /// deeper exists in cities). Start point of the fallback walk.
+    pub texture_max_zoom: u8,
+    /// Deepest zoom the heightmap provider serves (Mapzen Terrarium: 15).
+    /// Start point of the fallback walk.
+    pub heightmap_max_zoom: u8,
     /// Attribution strings recorded in the GLB `extras`.
     pub imagery_attribution: String,
     /// See `imagery_attribution`.
@@ -28,7 +36,8 @@ impl Default for Provider {
                 "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/:zoom:/:y:/:x:"
                     .into(),
             heightmap_url: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/:zoom:/:x:/:y:.png".into(),
-            native_terrain_zoom: 15,
+            texture_max_zoom: 19,
+            heightmap_max_zoom: 15,
             imagery_attribution: "Esri World Imagery".into(),
             elevation_attribution: "Mapzen Terrain Tiles (Terrarium) on AWS Open Data".into(),
         }
@@ -52,6 +61,14 @@ impl Kind {
             Kind::Heightmap => "heightmap",
         }
     }
+
+    /// Human name for logs and errors.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Texture => "imagery",
+            Kind::Heightmap => "heightmap",
+        }
+    }
 }
 
 impl Provider {
@@ -62,6 +79,14 @@ impl Provider {
             Kind::Heightmap => &self.heightmap_url,
         };
         expand_url(template, tile)
+    }
+
+    /// The most-provided-zoom hint for an asset.
+    pub fn max_zoom(&self, kind: Kind) -> u8 {
+        match kind {
+            Kind::Texture => self.texture_max_zoom,
+            Kind::Heightmap => self.heightmap_max_zoom,
+        }
     }
 }
 

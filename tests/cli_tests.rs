@@ -43,16 +43,53 @@ fn invalid_tile_exits_2() {
 }
 
 #[test]
-fn above_native_zoom_exits_2_with_message() {
+fn deep_zoom_builds_from_cached_ancestor_and_refresh_clears_markers() {
     let dir = tempfile::tempdir().unwrap();
+    let z15 = TileId::new(15, 16_000, 12_800).unwrap();
+    seed_block(dir.path(), z15);
+    let srv = Server::start(vec![]);
+    let out_path = dir.path().join("deep.glb");
     let out = bin()
-        .args(["build", "16", "1", "1"])
+        .args([
+            "build",
+            "20",
+            &(16_000u32 << 5).to_string(),
+            &(12_800u32 << 5).to_string(),
+            "-v",
+        ])
+        .arg("--cache-dir")
+        .arg(dir.path())
+        .arg("-o")
+        .arg(&out_path)
+        .args(["--texture-url", &format!("{}/t/:zoom:/:x:/:y:", srv.base)])
+        .args([
+            "--heightmap-url",
+            &format!("{}/h/:zoom:/:x:/:y:.png", srv.base),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let extras = &glb_json(&std::fs::read(&out_path).unwrap())["extras"];
+    assert_eq!(extras["terrain_source_zoom"], 15);
+    assert_eq!(extras["resolution"], 9);
+    // imagery walked 19..16 (4 markers); refresh-404 removes them
+    let out = bin()
+        .args(["refresh-404", "--kind", "texture"])
         .arg("--cache-dir")
         .arg(dir.path())
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("native terrain zoom"));
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("removed 4 markers"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]

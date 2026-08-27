@@ -31,10 +31,14 @@ pub struct TileMeta {
     pub tile: TileId,
     /// Edge length in metres (at the tile's centre latitude).
     pub tile_size_m: f64,
-    /// Vertices per edge.
+    /// Vertices per edge actually used.
     pub resolution: u32,
-    /// Heightmap came from the provider natively (false once synthesized).
-    pub native_terrain: bool,
+    /// The configured resolution when the useful ceiling clamped it.
+    pub resolution_requested: Option<u32>,
+    /// Zoom the heightmap was taken from (`== tile.zoom` when served directly).
+    pub terrain_source_zoom: u8,
+    /// Zoom the imagery was taken from (`== tile.zoom` when served directly).
+    pub imagery_source_zoom: u8,
     /// Imagery attribution.
     pub imagery_attribution: String,
     /// Elevation attribution.
@@ -142,7 +146,9 @@ pub fn write_glb(grid: &Grid, jpeg: &[u8], meta: &TileMeta) -> Vec<u8> {
             "tile_size_m": meta.tile_size_m,
             "bounds": { "north": b.north, "south": b.south, "west": b.west, "east": b.east },
             "resolution": meta.resolution,
-            "native_terrain": meta.native_terrain,
+            "resolution_requested": meta.resolution_requested,
+            "terrain_source_zoom": meta.terrain_source_zoom,
+            "imagery_source_zoom": meta.imagery_source_zoom,
             "units": "metres",
             "up": "+Y",
             "origin": "north-west corner; +X east, +Z south; Y is metres above sea level",

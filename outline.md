@@ -26,7 +26,7 @@ Kept identical to the engines (so tiles line up with what raytiles/bevytiles ren
 - 1:1 scale: tile edge = `earth circumference · cos(lat) / 2^zoom` metres (latitude-dependent).
 - Coordinate frame: Y-up, metres, origin at the tile corner, **Y = 0 is sea level** (tile-local in
   X/Z; absolute in Y — the client places a tile with an X/Z translation only).
-- Height source: Mapzen Terrarium (native to z15, synthesized above).
+- Height source: Mapzen Terrarium (served to z15; deeper tiles derive from the closest lower zoom).
 - Imagery source: Esri World Imagery by default, provider-agnostic via URL templates.
 - Cache layout for raw inputs: `{texture,heightmap}/z/x/y` (the engines' layout minus normals).
 
@@ -60,7 +60,7 @@ Kept identical to the engines (so tiles line up with what raytiles/bevytiles ren
 | **HTTP API** | XYZ route, cache headers, health |
 | **Input cache** | raw provider PNG/JPEG per asset (shared layout with the engines) |
 | **Output cache** | finished `.glb` per tile; the only thing served after first build |
-| **Providers** | URL templates + native-zoom ceiling per provider |
+| **Providers** | URL templates + most-provided-zoom hint per asset (start of the fallback walk) |
 | **Dedup / queue** | one in-flight build per key; concurrent requests wait on the same build |
 
 ## 6. Decisions (approved)
@@ -97,7 +97,8 @@ Approved output shape:
 1. **Builder core** — fetch + input cache, Terrarium decode, tile-size math ported from bevytiles.
 2. **CLI** — `open-tiles build <zoom> <x> <y>` writes a `.glb`; native-zoom tiles (z ≤ 15) with
    baked heights and embedded imagery. Verified in a stock glTF viewer before any server work.
-3. **Greater zoom (z 16–22)** — port height synthesis; lineage backfill in background.
+3. **Any zoom (z 1–22)** — heightmap and imagery fall back to the closest lower zoom the
+   provider serves (no "native zoom" concept); per-zoom resolution table (`detailed.md` §5).
 4. **Server** — XYZ route over the same builder; output cache; dedup of concurrent builds;
    error/404 semantics; cache headers; attribution.
 5. **Consumer proof** — load a neighbourhood of tiles in a stock glTF viewer and in
@@ -109,5 +110,5 @@ Approved output shape:
 - Seeding/pre-warm CLI (equivalent of raytiles' `scripts/tiles-cache.mjs`).
 - Object-storage backend and CDN cache invalidation.
 - Draco / meshopt compression, KTX2 textures, smooth vertex normals or normal maps.
-- Alternative height providers (e.g. Mapbox Terrain-RGB) and higher native zooms.
+- Alternative height providers (e.g. Mapbox Terrain-RGB) with deeper coverage.
 - A thin client crate/package that does what the engines' `store` + `lod` do, but against open-tiles.
