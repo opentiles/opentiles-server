@@ -1,0 +1,37 @@
+[package]
+name = "open-tiles"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "On-demand 3D terrain tiles (GLB) from Terrarium heightmaps and satellite imagery"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ziv/open-tiles"
+readme = "README.md"
+keywords = ["terrain", "gis", "gltf", "glb", "tiles"]
+categories = ["rendering", "science::geo"]
+
+[lib]
+name = "open_tiles"
+path = "src/lib.rs"
+
+[[bin]]
+name = "open-tiles"
+path = "src/bin/open-tiles.rs"
+
+[dependencies]
+ureq = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+
+[dev-dependencies]
+gltf = "1.4"
+tempfile = "3"
+tiny_http = "0.12"
+
+[profile.release]
+lto = "thin"
