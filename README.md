@@ -54,11 +54,16 @@ curl -I http://127.0.0.1:8080/12/772/1607.glb
 ## Docker
 
 ```sh
+docker run --rm -p 8080:8080 -v open-tiles-cache:/data ghcr.io/opentiles/opentiles-server:latest
+# or build locally:
 docker build -t open-tiles .
 docker run --rm -p 8080:8080 -v open-tiles-cache:/data open-tiles
 curl -I http://127.0.0.1:8080/12/772/1607.glb
 ```
 
+Every push to `main` publishes `ghcr.io/opentiles/opentiles-server` (`latest`, `main`,
+`sha-<commit>`; a `vX.Y.Z` git tag adds `X.Y.Z` and `X.Y`) for `linux/amd64` and `linux/arm64`
+via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml).
 The image (~145 MB, Debian slim + one static-ish binary, no OpenSSL) runs unprivileged and
 listens on `0.0.0.0:$PORT` (default `8080`, as injected by Cloud Run, Fly.io, Railway…). Both
 caches live under `$CACHE_DIR` (default `/data`) — mount a volume to keep built tiles across
