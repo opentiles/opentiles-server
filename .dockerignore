@@ -1,0 +1,13 @@
+# Build outputs and local caches — never send these to the Docker daemon.
+target
+.cache
+*.glb
+
+# Editor / VCS
+.git
+.idea
+
+# Docs aren't needed for the build (README.md is referenced by Cargo.toml but not required to compile).
+detailed.md
+outline.md
+plans.md
