@@ -51,6 +51,21 @@ curl -I http://127.0.0.1:8080/12/772/1607.glb
 - Provider flags (`--texture-url`, `--heightmap-url`, `--texture-max-zoom`,
   `--heightmap-max-zoom`, `--timeout`) work as for `build`.
 
+## Docker
+
+```sh
+docker build -t open-tiles .
+docker run --rm -p 8080:8080 -v open-tiles-cache:/data open-tiles
+curl -I http://127.0.0.1:8080/12/772/1607.glb
+```
+
+The image (~145 MB, Debian slim + one static-ish binary, no OpenSSL) runs unprivileged and
+listens on `0.0.0.0:$PORT` (default `8080`, as injected by Cloud Run, Fly.io, Railway…). Both
+caches live under `$CACHE_DIR` (default `/data`) — mount a volume to keep built tiles across
+restarts; it's safe to wipe. Extra container arguments go straight to `open-tiles serve`, e.g.
+`docker run … open-tiles --max-builds 2 --no-cors -vv`. The container stops with SIGINT so
+in-flight builds finish before shutdown.
+
 ## CLI
 
 ```sh
