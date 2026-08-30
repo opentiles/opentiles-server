@@ -7,7 +7,8 @@ Esri imagery — but with the heights baked into real geometry, so any glTF load
 terrain without a custom shader.
 
 Status: **milestones 1–5** — builder library, CLI, any zoom 1–22, HTTP server, browser example.
-See `outline.md` / `detailed.md`.
+See `outline.md` / `detailed.md`. The tile format itself — frame, mesh, heights, GLB layout,
+metadata, HTTP contract — is specified in [`specs.md`](specs.md).
 
 ## Try it
 
