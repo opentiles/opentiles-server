@@ -1,4 +1,4 @@
-# open-tiles
+# opentiles-server
 
 On-demand **3D terrain tiles as GLB**, at 1:1 world scale, addressed like a slippy map:
 `zoom/x/y`.
