@@ -2,3 +2,4 @@ target
 .cache
 *.glb
 .idea
+tmp.sh

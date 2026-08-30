@@ -9,8 +9,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use open_tiles::fetch::Fetcher;
 use open_tiles::provider::Kind;
 use open_tiles::server::ServeConfig;
+use open_tiles::store::Store;
 use open_tiles::{build_tile, Config, Error, TileId};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -51,9 +53,11 @@ struct BuildArgs {
     /// Output path (default: ./{zoom}-{x}-{y}.glb).
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Input cache root, shareable with raytiles / bevytiles.
-    #[arg(long, default_value = ".cache")]
-    cache_dir: PathBuf,
+    /// Input cache: a directory (shareable with raytiles / bevytiles) or
+    /// s3://bucket[/prefix] (AWS_REGION, credentials and AWS_ENDPOINT_URL
+    /// from the environment).
+    #[arg(long, default_value = ".cache", env = "CACHE_DIR")]
+    cache_dir: String,
     /// Vertices per edge for this zoom (2..=257); default comes from the
     /// per-zoom table and is capped by the height source's useful ceiling.
     #[arg(long)]
@@ -104,9 +108,9 @@ struct ServeArgs {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:8080")]
     bind: std::net::SocketAddr,
-    /// Input + output cache root.
-    #[arg(long, default_value = ".cache")]
-    cache_dir: PathBuf,
+    /// Input + output cache: a directory or s3://bucket[/prefix].
+    #[arg(long, default_value = ".cache", env = "CACHE_DIR")]
+    cache_dir: String,
     /// Concurrent tile builds (default: CPU count).
     #[arg(long)]
     max_builds: Option<usize>,
@@ -138,8 +142,8 @@ enum AssetKind {
 #[derive(Args)]
 struct RefreshArgs {
     /// Input cache root.
-    #[arg(long, default_value = ".cache")]
-    cache_dir: PathBuf,
+    #[arg(long, default_value = ".cache", env = "CACHE_DIR")]
+    cache_dir: String,
     /// Only this zoom (default: all).
     #[arg(long)]
     zoom: Option<u8>,
@@ -165,8 +169,12 @@ fn run_build(a: BuildArgs) -> i32 {
         Ok(t) => t,
         Err(e) => return fail(2, &e.into()),
     };
+    let cache = match open_cache(&a.cache_dir) {
+        Ok(c) => c,
+        Err(e) => return fail(4, &e),
+    };
     let mut cfg = Config {
-        cache_dir: a.cache_dir,
+        cache,
         ..Config::default()
     };
     a.provider.apply(&mut cfg);
@@ -214,8 +222,12 @@ fn run_lookup(a: LookupArgs) -> i32 {
 }
 
 fn run_serve(a: ServeArgs) -> i32 {
+    let cache = match open_cache(&a.cache_dir) {
+        Ok(c) => c,
+        Err(e) => return fail(4, &e),
+    };
     let mut cfg = Config {
-        cache_dir: a.cache_dir,
+        cache,
         ..Config::default()
     };
     a.provider.apply(&mut cfg);
@@ -238,7 +250,11 @@ fn run_serve(a: ServeArgs) -> i32 {
 }
 
 fn run_refresh(a: RefreshArgs) -> i32 {
-    let f = Fetcher::new(&a.cache_dir, Duration::from_secs(1), Duration::from_secs(1));
+    let cache = match open_cache(&a.cache_dir) {
+        Ok(c) => c,
+        Err(e) => return fail(4, &e),
+    };
+    let f = Fetcher::new(cache, Duration::from_secs(1), Duration::from_secs(1));
     let kind = a.kind.map(|k| match k {
         AssetKind::Texture => Kind::Texture,
         AssetKind::Heightmap => Kind::Heightmap,
@@ -250,6 +266,11 @@ fn run_refresh(a: RefreshArgs) -> i32 {
         }
         Err(e) => fail(4, &e.into()),
     }
+}
+
+/// `--cache-dir`: a directory or an `s3://` URL.
+fn open_cache(spec: &str) -> anyhow::Result<Arc<dyn Store>> {
+    open_tiles::store::open(spec).with_context(|| format!("opening cache {spec}"))
 }
 
 fn fail(code: i32, e: &anyhow::Error) -> i32 {

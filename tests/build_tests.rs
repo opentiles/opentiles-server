@@ -4,10 +4,7 @@ use common::*;
 use open_tiles::{build_tile, load_inputs, Config, Error, TileId};
 
 fn offline_config(cache: &std::path::Path) -> Config {
-    let mut cfg = Config {
-        cache_dir: cache.to_path_buf(),
-        ..Config::default()
-    };
+    let mut cfg = Config::with_cache_dir(cache);
     // any network access is a test failure: point the provider at a dead port
     cfg.provider.texture_url = "http://127.0.0.1:9/t/:zoom:/:x:/:y:".into();
     cfg.provider.heightmap_url = "http://127.0.0.1:9/h/:zoom:/:x:/:y:.png".into();

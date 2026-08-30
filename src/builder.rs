@@ -6,18 +6,21 @@ use crate::glb::{write_glb, TileMeta};
 use crate::imagery;
 use crate::mesh::{build_grid, check_resolution, useful_ceiling, ZOOM_LEVELS};
 use crate::provider::{Kind, Provider};
+use crate::store::{LocalStore, Store};
 use crate::terrain::{decode_heightmap_png, HeightField};
 use crate::tile::{TileId, MIN_ZOOM};
 use crate::{Error, Result};
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Builder configuration. Every field defaulted; the defaults mirror the
 /// engines' `NetworkConfig` so caches are interchangeable.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Root of the input cache (`{cache_dir}/{texture,heightmap}/z/x/y.png`).
-    pub cache_dir: PathBuf,
+    /// The cache: inputs under `{texture,heightmap}/z/x/y.png`, and — when
+    /// serving — built tiles under `glb/{fingerprint}/z/x/y.glb`. A local
+    /// directory by default; see [`store::open`](crate::store::open) for S3.
+    pub cache: Arc<dyn Store>,
     /// Where inputs come from.
     pub provider: Provider,
     /// Vertices per edge of the output grid per zoom, indexed
@@ -38,7 +41,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            cache_dir: PathBuf::from(".cache"),
+            cache: Arc::new(LocalStore::new(".cache")),
             provider: Provider::default(),
             resolution: crate::mesh::DEFAULT_RESOLUTIONS,
             connect_timeout: Duration::from_secs(5),
@@ -49,6 +52,14 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Defaults with the cache in a local directory.
+    pub fn with_cache_dir(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            cache: Arc::new(LocalStore::new(dir)),
+            ..Self::default()
+        }
+    }
+
     /// The configured resolution for `zoom`.
     pub fn resolution_for(&self, zoom: u8) -> u32 {
         self.resolution[(zoom.clamp(MIN_ZOOM, crate::tile::MAX_ZOOM) - MIN_ZOOM) as usize]
@@ -94,7 +105,7 @@ pub struct TileInputs {
 /// other neighbour failure fails the build — a transient error must not
 /// silently produce a different mesh that then gets cached as the tile.
 pub fn load_inputs(cfg: &Config, tile: TileId) -> Result<TileInputs> {
-    let fetcher = Fetcher::new(&cfg.cache_dir, cfg.connect_timeout, cfg.read_timeout);
+    let fetcher = Fetcher::new(cfg.cache.clone(), cfg.connect_timeout, cfg.read_timeout);
     let fetcher = &fetcher;
 
     // resolve the height source first: the neighbour set depends on it

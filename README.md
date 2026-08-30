@@ -38,9 +38,11 @@ curl -I http://127.0.0.1:8080/12/772/1607.glb
 ```
 
 - `GET /{z}/{x}/{y}.glb` — built on first request, then served from
-  `{cache_dir}/glb/{fingerprint}/z/x/y.glb`. The *fingerprint* hashes everything that changes the
+  `glb/{fingerprint}/z/x/y.glb` in the cache. The *fingerprint* hashes everything that changes the
   bytes (version, resolution table, provider URLs and zoom hints, JPEG quality), so a config
   change never serves stale geometry — old fingerprint directories can simply be deleted.
+- `--cache-dir` (or `$CACHE_DIR`) is a local directory **or `s3://bucket[/prefix]`** — see
+  "Cache on S3" below. Both tiers (provider inputs and built tiles) live there.
 - Concurrent requests for one tile share a single build; `--max-builds` (default: CPU count)
   bounds parallel builds. No broker — one process, in-memory dedup.
 - `If-None-Match` → `304`; `HEAD` supported; `400` invalid tile; `404` nothing upstream at any
@@ -54,12 +56,26 @@ curl -I http://127.0.0.1:8080/12/772/1607.glb
 ## Docker
 
 ```sh
-docker run --rm -p 8080:8080 -v open-tiles-cache:/data ghcr.io/opentiles/opentiles-server:latest
+docker run --rm -p 8080:8080 -e AWS_REGION=eu-north-1 \
+  -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… ghcr.io/opentiles/opentiles-server:latest
 # or build locally:
 docker build -t open-tiles .
-docker run --rm -p 8080:8080 -v open-tiles-cache:/data open-tiles
+docker run --rm -p 8080:8080 -e AWS_REGION=eu-north-1 -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… open-tiles
 curl -I http://127.0.0.1:8080/12/772/1607.glb
 ```
+
+Every push to `main` publishes `ghcr.io/opentiles/opentiles-server` (`latest`, `main`,
+`sha-<commit>`; a `vX.Y.Z` git tag adds `X.Y.Z` and `X.Y`) for `linux/amd64` and `linux/arm64`
+via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml).
+The image (~175 MB, Debian slim + one binary, no OpenSSL) runs unprivileged and listens on
+`0.0.0.0:$PORT` (default `8080`, as injected by Cloud Run, Fly.io, Railway…). The cache defaults
+to **S3** (`CACHE_DIR=s3://opentiles-cache/cache`), so the container is stateless and any number
+of replicas share one cache; credentials come from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+or the platform's IAM role, and `AWS_REGION` must be set. Point `CACHE_DIR` at another bucket
+(`s3://my-tiles/prefix`) or at a directory to cache locally instead:
+`docker run -p 8080:8080 -e CACHE_DIR=/data -v open-tiles-cache:/data open-tiles`. Extra container
+arguments go straight to `open-tiles serve`, e.g. `docker run … open-tiles --max-builds 2 --no-cors -vv`.
+The container stops with SIGINT so in-flight builds finish before shutdown.
 
 Every push to `main` publishes `ghcr.io/opentiles/opentiles-server` (`latest`, `main`,
 `sha-<commit>`; a `vX.Y.Z` git tag adds `X.Y.Z` and `X.Y`) for `linux/amd64` and `linux/arm64`
@@ -70,6 +86,42 @@ caches live under `$CACHE_DIR` (default `/data`) — mount a volume to keep buil
 restarts; it's safe to wipe. Extra container arguments go straight to `open-tiles serve`, e.g.
 `docker run … open-tiles --max-builds 2 --no-cors -vv`. The container stops with SIGINT so
 in-flight builds finish before shutdown.
+
+## Cache on S3
+
+```sh
+AWS_REGION=eu-central-1 open-tiles serve --cache-dir s3://my-tiles/open-tiles --bind 0.0.0.0:8080
+```
+
+Point `--cache-dir` (or `CACHE_DIR`) at `s3://bucket[/prefix]` and both cache tiers become
+objects in that bucket, with the same key layout as the directory version
+(`{prefix}/texture/z/x/y.png`, `{prefix}/glb/{fingerprint}/z/x/y.glb`, `.404` markers). That
+makes the server stateless: any number of replicas — or ephemeral containers on Cloud Run /
+Fargate — share one cache, and nothing is rebuilt after a restart.
+
+- **Credentials and region** come from the standard AWS environment: `AWS_REGION`,
+  `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, or an IAM role (EC2 instance
+  profile, ECS task role, EKS IRSA). No open-tiles-specific settings.
+- **IAM:** `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on `bucket/prefix/*` and
+  `s3:ListBucket` on the bucket. Without `ListBucket`, S3 answers `403` instead of `404` for
+  keys that don't exist; open-tiles treats such a `403` as a miss (and warns once at startup)
+  so it still works, but grant `ListBucket` so real read-permission problems stay visible and
+  `refresh-404` can list markers.
+- **TLS:** the S3 client trusts Mozilla's root CAs (bundled in the binary) *plus* the
+  platform's — so it works in a slim container without `ca-certificates`, and behind a
+  corporate proxy whose CA is installed or named by `SSL_CERT_FILE` (which, on its own, would
+  replace the platform roots and break the connection).
+- **S3-compatible stores** (MinIO, LocalStack, Ceph, R2…): set `AWS_ENDPOINT_URL`
+  (or `AWS_ENDPOINT_URL_S3`); path-style addressing is switched on automatically.
+- `open-tiles build --cache-dir s3://…` and `refresh-404 --cache-dir s3://…` work the same way.
+- Each cache operation is one S3 request (a build touches ~10 inputs, in parallel). Concurrent
+  writers of the same key are harmless: puts are atomic and the bytes are identical.
+- The S3 backend is the `s3` cargo feature (on by default);
+  `cargo build --no-default-features` drops the AWS SDK.
+
+Tests: `tests/s3_tests.rs` runs against a real bucket when `OPEN_TILES_TEST_S3=s3://bucket/prefix`
+is set (any S3-compatible endpoint; the file's header shows a one-line MinIO setup) and is
+skipped otherwise.
 
 ## CLI
 
@@ -98,7 +150,7 @@ Options for `build`:
 | flag | default | meaning |
 |---|---|---|
 | `-o, --output <path>` | `./{zoom}-{x}-{y}.glb` | where to write |
-| `--cache-dir <dir>` | `.cache` | input cache, layout-compatible with raytiles/bevytiles |
+| `--cache-dir <dir\|s3://…>` | `.cache` (`$CACHE_DIR`) | input cache: a directory (layout-compatible with raytiles/bevytiles) or an S3 bucket |
 | `--resolution <n>` | per-zoom table (below) | vertices per edge for this zoom (2..=257) |
 | `--texture-url`, `--heightmap-url` | Esri / AWS Terrarium | provider templates with `:zoom:` `:x:` `:y:` tokens |
 | `--texture-max-zoom`, `--heightmap-max-zoom` | `19` / `15` | deepest zoom to *ask* the provider for; deeper tiles derive from there |
@@ -165,8 +217,10 @@ use open_tiles::{build_tile, Config, TileId};
 let glb = build_tile(&Config::default(), TileId::new(12, 772, 1607)?)?;
 ```
 
-`Config` mirrors the engines' `NetworkConfig` (cache dir, provider URL templates + zoom hints,
-timeouts) plus the per-zoom `resolution` table. `load_inputs` exposes the windowed height field,
+`Config` mirrors the engines' `NetworkConfig` (cache, provider URL templates + zoom hints,
+timeouts) plus the per-zoom `resolution` table. `Config::with_cache_dir(path)` caches on disk;
+`Config { cache: open_tiles::store::open("s3://bucket/prefix")?, ..Default::default() }` caches in
+S3 — or implement the `Store` trait for anything else. `load_inputs` exposes the windowed height field,
 imagery and the source tiles without building the GLB.
 
 ## Tests

@@ -1,21 +1,21 @@
 //! The HTTP server: `GET /{z}/{x}/{y}.glb`, built on first request, served
 //! from the output cache afterwards, one build per tile at a time.
 //!
-//! Two-tier cache: the builder's input cache (`{cache_dir}/{texture,heightmap}`)
-//! and this module's output cache `{cache_dir}/glb/{fingerprint}/{z}/{x}/{y}.glb`.
+//! Two-tier cache, both tiers in the one [`Store`](crate::store::Store) of
+//! the [`Config`]: the builder's input cache (`{texture,heightmap}/…`) and
+//! this module's output cache `glb/{fingerprint}/{z}/{x}/{y}.glb`.
 //! The fingerprint hashes everything that changes the bytes — crate version,
 //! resolution table, provider URLs and zoom hints, JPEG quality — so a config
 //! change can never serve stale geometry.
 //!
 //! Dedup: the first request for a tile is the *leader* — it takes a build
-//! permit, builds under `spawn_blocking`, writes the cache file atomically,
+//! permit, builds under `spawn_blocking`, publishes the tile to the cache,
 //! removes the in-flight entry and publishes the outcome on a `watch`
 //! channel; concurrent requests for the same tile wait on that channel.
 //! Failures are published too, so waiters fail fast instead of each retrying
-//! upstream. Requests arriving after publication hit the cache file.
+//! upstream. Requests arriving after publication hit the cache.
 
 use crate::builder::{build_tile, Config};
-use crate::fetch::write_atomic;
 use crate::tile::TileId;
 use crate::Error;
 use axum::body::Body;
@@ -27,7 +27,6 @@ use axum::Router;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
@@ -69,14 +68,9 @@ pub fn fingerprint(cfg: &Config) -> String {
     h.finalize().to_hex()[..16].to_string()
 }
 
-/// Output-cache path of a tile under `fingerprint`.
-pub fn output_path(cfg: &Config, fingerprint: &str, tile: TileId) -> PathBuf {
-    cfg.cache_dir
-        .join("glb")
-        .join(fingerprint)
-        .join(tile.zoom.to_string())
-        .join(tile.x.to_string())
-        .join(format!("{}.glb", tile.y))
+/// Output-cache key of a tile under `fingerprint`.
+pub fn output_key(fingerprint: &str, tile: TileId) -> String {
+    format!("glb/{fingerprint}/{}/{}/{}.glb", tile.zoom, tile.x, tile.y)
 }
 
 type Outcome = Result<Arc<[u8]>, Arc<Error>>;
@@ -110,12 +104,17 @@ impl AppState {
 
     /// The tile bytes: output cache, or a (deduplicated) build.
     pub async fn tile(self: &Arc<Self>, tile: TileId) -> Outcome {
-        let path = output_path(&self.cfg, &self.fingerprint, tile);
-        if let Ok(bytes) = tokio::fs::read(&path).await {
-            if !bytes.is_empty() {
+        let key = output_key(&self.fingerprint, tile);
+        let (store, k) = (self.cfg.cache.clone(), key.clone());
+        match tokio::task::spawn_blocking(move || store.get(&k)).await {
+            Ok(Ok(Some(bytes))) if !bytes.is_empty() => {
                 log::debug!("{tile}: output cache hit");
                 return Ok(bytes.into());
             }
+            Ok(Ok(_)) => {}
+            // an unreadable cache is a reason to rebuild, not to fail the request
+            Ok(Err(e)) => log::warn!("{tile}: output cache read failed, rebuilding: {e}"),
+            Err(join) => log::warn!("{tile}: output cache read panicked, rebuilding: {join}"),
         }
 
         // join an in-flight build, or become its leader
@@ -131,7 +130,7 @@ impl AppState {
         };
 
         if let Some(tx) = tx {
-            let outcome = self.lead_build(tile, &path).await;
+            let outcome = self.lead_build(tile, key).await;
             self.inflight
                 .lock()
                 .expect("inflight poisoned")
@@ -155,14 +154,13 @@ impl AppState {
         }
     }
 
-    async fn lead_build(&self, tile: TileId, path: &std::path::Path) -> Outcome {
+    async fn lead_build(&self, tile: TileId, key: String) -> Outcome {
         let _permit = self.builds.acquire().await.expect("semaphore closed");
         let cfg = self.cfg.clone();
-        let path = path.to_path_buf();
         let started = std::time::Instant::now();
         let res = tokio::task::spawn_blocking(move || {
             let glb = build_tile(&cfg, tile)?;
-            write_atomic(&path, &glb)?;
+            cfg.cache.put(&key, &glb)?;
             Ok::<_, Error>(glb)
         })
         .await;
@@ -204,10 +202,11 @@ pub async fn run(cfg: Config, serve: ServeConfig) -> std::io::Result<()> {
     let bind = serve.bind;
     let state = AppState::new(cfg, serve);
     log::info!(
-        "open-tiles {} listening on http://{bind}  (fingerprint {}, {} concurrent builds)",
+        "open-tiles {} listening on http://{bind}  (fingerprint {}, {} concurrent builds, cache {})",
         env!("CARGO_PKG_VERSION"),
         state.fingerprint,
-        state.serve.max_builds
+        state.serve.max_builds,
+        state.cfg.cache.location()
     );
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, router(state))

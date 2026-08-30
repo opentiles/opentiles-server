@@ -1,7 +1,7 @@
 mod common;
 
 use common::*;
-use open_tiles::server::{fingerprint, output_path, router, AppState, ServeConfig};
+use open_tiles::server::{fingerprint, output_key, router, AppState, ServeConfig};
 use open_tiles::{build_tile, Config, TileId};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,11 +17,7 @@ async fn serve(cfg: Config, serve: ServeConfig) -> (String, Arc<AppState>) {
 }
 
 fn cfg_for(cache: &std::path::Path, srv: &Server) -> Config {
-    let mut cfg = Config {
-        cache_dir: cache.to_path_buf(),
-        ..Config::default()
-    }
-    .with_uniform_resolution(17);
+    let mut cfg = Config::with_cache_dir(cache).with_uniform_resolution(17);
     cfg.provider.heightmap_url = format!("{}/h/:zoom:/:x:/:y:.png", srv.base);
     cfg.provider.texture_url = format!("{}/t/:zoom:/:x:/:y:", srv.base);
     cfg.connect_timeout = std::time::Duration::from_millis(500);
@@ -84,7 +80,7 @@ async fn serves_tiles_with_cache_headers_and_output_cache() {
     assert!(etag.starts_with(&format!("\"{}-", state.fingerprint())));
 
     // output cache written under the fingerprint
-    let cached = output_path(&cfg, state.fingerprint(), centre);
+    let cached = dir.path().join(output_key(state.fingerprint(), centre));
     assert_eq!(std::fs::read(&cached).unwrap(), expected);
 
     // 304 on a matching ETag
@@ -204,11 +200,10 @@ fn fingerprint_tracks_the_config() {
     assert_eq!(fa, fingerprint(&Config::default()));
     assert_ne!(fa, fb);
     assert_ne!(fa, fc);
-    // cache dir and timeouts don't change the bytes, so not the fingerprint
+    // cache location and timeouts don't change the bytes, so not the fingerprint
     let d = Config {
-        cache_dir: "/elsewhere".into(),
         read_timeout: std::time::Duration::from_secs(99),
-        ..Config::default()
+        ..Config::with_cache_dir("/elsewhere")
     };
     assert_eq!(fa, fingerprint(&d));
 }
