@@ -23,13 +23,22 @@ ureq = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 thiserror = "2"
 anyhow = "1"
 log = "0.4"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "signal", "net"] }
 blake3 = "1"
+# S3 cache backend (feature `s3`). ring + rustls: no OpenSSL at build or runtime.
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+# The SDK trusts platform roots only (empty in a slim container; behind a
+# corporate proxy `SSL_CERT_FILE` may hold just its CA): bundle Mozilla's too.
+aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"], optional = true }
+aws-smithy-types = { version = "1", optional = true }
+webpki-root-certs = { version = "1", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 [dev-dependencies]
 gltf = "1.4"
@@ -38,3 +47,16 @@ tiny_http = "0.12"
 
 [profile.release]
 lto = "thin"
+
+[features]
+default = ["s3"]
+# `--cache-dir s3://bucket/prefix`: cache inputs and built tiles in S3
+# (or any S3-compatible store). Disable to drop the AWS SDK dependency tree.
+s3 = [
+    "dep:aws-config",
+    "dep:aws-sdk-s3",
+    "dep:aws-smithy-http-client",
+    "dep:aws-smithy-types",
+    "dep:webpki-root-certs",
+    "dep:rustls-native-certs",
+]

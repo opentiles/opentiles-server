@@ -45,11 +45,13 @@ pub mod imagery;
 pub mod mesh;
 pub mod provider;
 pub mod server;
+pub mod store;
 pub mod terrain;
 pub mod tile;
 
 pub use builder::{build_tile, load_inputs, Config, TileInputs};
 pub use provider::Provider;
+pub use store::Store;
 pub use tile::{TileId, MAX_ZOOM, MIN_ZOOM};
 
 /// Everything that can go wrong while building a tile.
@@ -83,10 +85,10 @@ pub enum Error {
         /// Decoder message.
         reason: String,
     },
-    /// Filesystem failure (cache read/write).
+    /// Cache failure (filesystem or object store read/write).
     #[error("io {path}: {source}")]
     Io {
-        /// The path involved.
+        /// The path or object URL involved.
         path: String,
         /// Underlying error.
         #[source]

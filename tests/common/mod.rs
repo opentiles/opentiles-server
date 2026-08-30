@@ -85,6 +85,11 @@ pub fn seed(cache: &Path, kind: &str, tile: TileId, bytes: &[u8]) {
 /// Seed a tile and its 8 neighbours with a single continuous ramp across all
 /// of them (`height = global_x + 0.5 * global_y` in texels), plus imagery.
 pub fn seed_block(cache: &Path, centre: TileId) {
+    seed_block_into(&open_tiles::store::LocalStore::new(cache), centre);
+}
+
+/// [`seed_block`] into any store (the S3 tests seed a bucket).
+pub fn seed_block_into(store: &dyn open_tiles::Store, centre: TileId) {
     for dy in -1..=1 {
         for dx in -1..=1 {
             let t = centre.offset(dx, dy).unwrap();
@@ -93,8 +98,9 @@ pub fn seed_block(cache: &Path, centre: TileId) {
                     + f64::from(x)
                     + 0.5 * (f64::from(dy + 1) * 256.0 + f64::from(y))
             });
-            seed(cache, "heightmap", t, &png);
-            seed(cache, "texture", t, &imagery_jpeg());
+            let key = |kind: &str| format!("{kind}/{}/{}/{}.png", t.zoom, t.x, t.y);
+            store.put(&key("heightmap"), &png).unwrap();
+            store.put(&key("texture"), &imagery_jpeg()).unwrap();
         }
     }
 }

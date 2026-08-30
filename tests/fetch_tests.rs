@@ -3,11 +3,17 @@ mod common;
 use common::*;
 use open_tiles::fetch::{Fetcher, Origin};
 use open_tiles::provider::Kind;
+use open_tiles::store::LocalStore;
 use open_tiles::{Error, TileId};
+use std::sync::Arc;
 use std::time::Duration;
 
 fn fetcher(dir: &std::path::Path) -> Fetcher {
-    Fetcher::new(dir, Duration::from_secs(2), Duration::from_secs(2))
+    Fetcher::new(
+        Arc::new(LocalStore::new(dir)),
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    )
 }
 
 #[test]

@@ -9,7 +9,8 @@
 # image codecs), so the runtime image needs nothing beyond glibc.
 #
 #   docker build -t open-tiles .
-#   docker run --rm -p 8080:8080 -v open-tiles-cache:/data open-tiles
+#   docker run --rm -p 8080:8080 -e AWS_REGION=eu-north-1 \
+#     -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… open-tiles
 #   curl -I http://127.0.0.1:8080/12/772/1607.glb
 # ---------------------------------------------------------------------------
 
@@ -40,9 +41,10 @@ LABEL org.opencontainers.image.title="open-tiles" \
       org.opencontainers.image.source="https://github.com/ziv/open-tiles" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
-# Run unprivileged. /data holds both the upstream input cache
-# ({texture,heightmap}/…) and the built-tile output cache (glb/<fingerprint>/…).
-# Mount a volume there to keep tiles across restarts; it's safe to wipe.
+# Run unprivileged. The cache — upstream inputs ({texture,heightmap}/…) and
+# built tiles (glb/<fingerprint>/…) — lives in S3 by default (CACHE_DIR below,
+# plus AWS_REGION and credentials / an IAM role at runtime). /data exists for
+# opting into a local cache instead: CACHE_DIR=/data with a volume mounted there.
 RUN groupadd --system --gid 10001 opentiles \
     && useradd --system --uid 10001 --gid opentiles --home-dir /data --shell /usr/sbin/nologin opentiles \
     && mkdir -p /data \
@@ -53,12 +55,12 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 USER opentiles
 WORKDIR /data
-VOLUME ["/data"]
 
-# PORT and CACHE_DIR are read by the entrypoint; both are what cloud platforms
-# conventionally inject. Set RUST_BACKTRACE for readable panics in logs.
+# PORT and CACHE_DIR are read by the entrypoint (PORT is what cloud platforms
+# inject). CACHE_DIR: s3://bucket[/prefix] or a directory such as /data.
+# Set RUST_BACKTRACE for readable panics in logs.
 ENV PORT=8080 \
-    CACHE_DIR=/data \
+    CACHE_DIR=s3://opentiles-cache/cache \
     RUST_BACKTRACE=1
 
 EXPOSE 8080
