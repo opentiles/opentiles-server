@@ -1,13 +1,9 @@
 # open-tiles
 
 On-demand **3D terrain tiles as GLB**, at 1:1 world scale, addressed like a slippy map:
-`zoom/x/y`. Built from the same inputs [raytiles](https://github.com/ziv/raytiles) and
-[bevytiles](https://github.com/ziv/bevytiles) stream at runtime — Mapzen Terrarium heightmaps and
-Esri imagery — but with the heights baked into real geometry, so any glTF loader can show the
-terrain without a custom shader.
+`zoom/x/y`.
 
-Status: **milestones 1–5** — builder library, CLI, any zoom 1–22, HTTP server, browser example.
-See `outline.md` / `detailed.md`. The tile format itself — frame, mesh, heights, GLB layout,
+The tile format itself — frame, mesh, heights, GLB layout,
 metadata, HTTP contract — is specified in [`specs.md`](specs.md).
 
 ## Try it
@@ -16,16 +12,6 @@ metadata, HTTP contract — is specified in [`specs.md`](specs.md).
 cargo run --release -- serve
 open http://127.0.0.1:8080/example/
 ```
-
-The bundled [`example/index.html`](example/index.html) is a plain three.js page: pick a
-lat/lon, zoom and an n × n block of tiles, press **Load**, then orbit (drag), pan (right-drag)
-and zoom (wheel). Parameters live in the URL, e.g.
-`/example/?lat=36.07&lon=-112.10&zoom=14&n=5` — the Grand Canyon default — or
-`/example/?lat=32.08&lon=34.77&zoom=14&n=3&grid` for the Tel Aviv shoreline with a sea-level
-grid. It uses the tile convention directly: tile `(x, y)` sits at `(dx · S, 0, dy · S)`, scaled
-by `S / tile_size_m` in X/Z so Mercator rows meet exactly. The same file works from any static
-server (`python3 -m http.server` inside `example/`, then set the *server* field) thanks to CORS.
-
 ## Server
 
 ```sh
@@ -64,30 +50,6 @@ docker build -t open-tiles .
 docker run --rm -p 8080:8080 -e AWS_REGION=eu-north-1 -e AWS_ACCESS_KEY_ID=… -e AWS_SECRET_ACCESS_KEY=… open-tiles
 curl -I http://127.0.0.1:8080/12/772/1607.glb
 ```
-
-Every push to `main` publishes `ghcr.io/opentiles/opentiles-server` (`latest`, `main`,
-`sha-<commit>`; a `vX.Y.Z` git tag adds `X.Y.Z` and `X.Y`) for `linux/amd64` and `linux/arm64`
-via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml).
-The image (~175 MB, Debian slim + one binary, no OpenSSL) runs unprivileged and listens on
-`0.0.0.0:$PORT` (default `8080`, as injected by Cloud Run, Fly.io, Railway…). The cache defaults
-to **S3** (`CACHE_DIR=s3://opentiles-cache/cache`), so the container is stateless and any number
-of replicas share one cache; credentials come from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
-or the platform's IAM role, and `AWS_REGION` must be set. Point `CACHE_DIR` at another bucket
-(`s3://my-tiles/prefix`) or at a directory to cache locally instead:
-`docker run -p 8080:8080 -e CACHE_DIR=/data -v open-tiles-cache:/data open-tiles`. Extra container
-arguments go straight to `open-tiles serve`, e.g. `docker run … open-tiles --max-builds 2 --no-cors -vv`.
-The container stops with SIGINT so in-flight builds finish before shutdown.
-
-Every push to `main` publishes `ghcr.io/opentiles/opentiles-server` (`latest`, `main`,
-`sha-<commit>`; a `vX.Y.Z` git tag adds `X.Y.Z` and `X.Y`) for `linux/amd64` and `linux/arm64`
-via [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml).
-The image (~145 MB, Debian slim + one static-ish binary, no OpenSSL) runs unprivileged and
-listens on `0.0.0.0:$PORT` (default `8080`, as injected by Cloud Run, Fly.io, Railway…). Both
-caches live under `$CACHE_DIR` (default `/data`) — mount a volume to keep built tiles across
-restarts; it's safe to wipe. Extra container arguments go straight to `open-tiles serve`, e.g.
-`docker run … open-tiles --max-builds 2 --no-cors -vv`. The container stops with SIGINT so
-in-flight builds finish before shutdown.
-
 ## Cache on S3
 
 ```sh
@@ -148,15 +110,15 @@ target/release/open-tiles build 20 790547 411413 -v
 
 Options for `build`:
 
-| flag | default | meaning |
-|---|---|---|
-| `-o, --output <path>` | `./{zoom}-{x}-{y}.glb` | where to write |
-| `--cache-dir <dir\|s3://…>` | `.cache` (`$CACHE_DIR`) | input cache: a directory (layout-compatible with raytiles/bevytiles) or an S3 bucket |
-| `--resolution <n>` | per-zoom table (below) | vertices per edge for this zoom (2..=257) |
-| `--texture-url`, `--heightmap-url` | Esri / AWS Terrarium | provider templates with `:zoom:` `:x:` `:y:` tokens |
-| `--texture-max-zoom`, `--heightmap-max-zoom` | `19` / `15` | deepest zoom to *ask* the provider for; deeper tiles derive from there |
-| `--timeout <s>` | `10` | HTTP read timeout |
-| `-v` / `-vv` | | log fetches, fallbacks and timings |
+| flag                                         | default                 | meaning                                                                              |
+|----------------------------------------------|-------------------------|--------------------------------------------------------------------------------------|
+| `-o, --output <path>`                        | `./{zoom}-{x}-{y}.glb`  | where to write                                                                       |
+| `--cache-dir <dir\|s3://…>`                  | `.cache` (`$CACHE_DIR`) | input cache: a directory (layout-compatible with raytiles/bevytiles) or an S3 bucket |
+| `--resolution <n>`                           | per-zoom table (below)  | vertices per edge for this zoom (2..=257)                                            |
+| `--texture-url`, `--heightmap-url`           | Esri / AWS Terrarium    | provider templates with `:zoom:` `:x:` `:y:` tokens                                  |
+| `--texture-max-zoom`, `--heightmap-max-zoom` | `19` / `15`             | deepest zoom to *ask* the provider for; deeper tiles derive from there               |
+| `--timeout <s>`                              | `10`                    | HTTP read timeout                                                                    |
+| `-v` / `-vv`                                 |                         | log fetches, fallbacks and timings                                                   |
 
 Exit codes: `0` ok · `2` usage / invalid tile / bad resolution · `3` nothing upstream at any
 zoom · `4` network, decode or I/O failure.
@@ -186,10 +148,10 @@ z−1 texel's gradient is possible — that is the dataset's edge.
 Vertex spacing tracks the data: every tile carries 256 source texels while its metre size halves
 per zoom. Defaults (vertices per edge), overridable with `--resolution` for a zoom:
 
-| zoom | 1–7 | 8–15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 |
-|---|---|---|---|---|---|---|---|---|---|
-| vertices/edge | 257 | 129 | 129 | 65 | 33 | 17 | 9 | 5 | 3 |
-| raw mesh | 2.9 MB | 0.5 MB | 0.5 MB | 0.13 MB | 33 KB | 9 KB | 2.5 KB | <1 KB | <1 KB |
+| zoom          | 1–7    | 8–15   | 16     | 17      | 18    | 19   | 20     | 21    | 22    |
+|---------------|--------|--------|--------|---------|-------|------|--------|-------|-------|
+| vertices/edge | 257    | 129    | 129    | 65      | 33    | 17   | 9      | 5     | 3     |
+| raw mesh      | 2.9 MB | 0.5 MB | 0.5 MB | 0.13 MB | 33 KB | 9 KB | 2.5 KB | <1 KB | <1 KB |
 
 Whatever zoom the heights really came from, the value is capped at `(256 >> dz) + 1` — beyond
 that a grid only interpolates. `extras.resolution` records the value used
@@ -215,7 +177,7 @@ that a grid only interpolates. `extras.resolution` records the value used
 ```rust
 use open_tiles::{build_tile, Config, TileId};
 
-let glb = build_tile(&Config::default(), TileId::new(12, 772, 1607)?)?;
+let glb = build_tile( & Config::default (), TileId::new(12, 772, 1607) ? ) ?;
 ```
 
 `Config` mirrors the engines' `NetworkConfig` (cache, provider URL templates + zoom hints,
