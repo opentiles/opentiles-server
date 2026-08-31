@@ -8,6 +8,7 @@ fn offline_config(cache: &std::path::Path) -> Config {
     // any network access is a test failure: point the provider at a dead port
     cfg.provider.texture_url = "http://127.0.0.1:9/t/:zoom:/:x:/:y:".into();
     cfg.provider.heightmap_url = "http://127.0.0.1:9/h/:zoom:/:x:/:y:.png".into();
+    cfg.provider.normals_url = "http://127.0.0.1:9/n/:zoom:/:x:/:y:.png".into();
     cfg.connect_timeout = std::time::Duration::from_millis(200);
     cfg
 }
@@ -204,6 +205,11 @@ fn deeper_tile_is_derived_from_the_closest_cached_zoom() {
     let inputs = load_inputs(&cfg, t).unwrap();
     assert_eq!(inputs.terrain_source, z15);
     assert_eq!(inputs.imagery_source, z15);
+    assert_eq!(
+        inputs.normals.as_ref().unwrap().1,
+        z15,
+        "normals windowed from the ancestor"
+    );
     assert_eq!(inputs.neighbours_present, 8);
     // the only network traffic is the imagery walk: heightmap starts at
     // min(18, 15) = 15 → cache hit, no request; imagery starts at
@@ -314,5 +320,108 @@ fn nothing_at_any_zoom_is_not_found() {
         srv.hits.lock().unwrap().len(),
         12,
         "markers must stop the retry"
+    );
+}
+
+// -- normals ------------------------------------------------------------------
+
+/// Read the NORMAL attribute out of a GLB via the gltf crate.
+fn read_normals(glb: &[u8]) -> Option<Vec<[f32; 3]>> {
+    let (doc, buffers, _) = gltf::import_slice(glb).unwrap();
+    let prim = doc.meshes().next().unwrap().primitives().next().unwrap();
+    let reader = prim.reader(|b| Some(&buffers[b.index()]));
+    reader.read_normals().map(|it| it.collect())
+}
+
+#[test]
+fn normals_come_from_the_provider_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let centre = TileId::new(10, 500, 400).unwrap();
+    seed_block(dir.path(), centre);
+    let cfg = offline_config(dir.path()).with_uniform_resolution(17);
+    let glb = build_tile(&cfg, centre).unwrap();
+
+    assert_eq!(glb_json(&glb)["extras"]["normals_source_zoom"], 10);
+    let normals = read_normals(&glb).expect("NORMAL attribute present");
+    assert_eq!(normals.len(), 17 * 17);
+    // seed_block seeds a constant tilted map: every vertex must decode to it
+    let len =
+        (SEEDED_NORMAL[0].powi(2) + SEEDED_NORMAL[1].powi(2) + SEEDED_NORMAL[2].powi(2)).sqrt();
+    let want = [
+        (SEEDED_NORMAL[0] / len) as f32,
+        (SEEDED_NORMAL[1] / len) as f32,
+        (SEEDED_NORMAL[2] / len) as f32,
+    ];
+    for n in &normals {
+        let norm = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        assert!((norm - 1.0).abs() < 1e-3, "not unit: {n:?}");
+        for a in 0..3 {
+            // 8-bit encoding: within one quantization step
+            assert!((n[a] - want[a]).abs() < 0.01, "{n:?} vs {want:?}");
+        }
+    }
+}
+
+#[test]
+fn normals_synthesized_from_heights_when_provider_has_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let centre = TileId::new(10, 500, 400).unwrap();
+    seed_block(dir.path(), centre);
+    std::fs::remove_dir_all(dir.path().join("normals")).unwrap();
+    let srv = Server::start(vec![]); // answers 404 to every normals request
+    let mut cfg = offline_config(dir.path()).with_uniform_resolution(17);
+    cfg.provider.normals_url = format!("{}/n/:zoom:/:x:/:y:.png", srv.base);
+    let glb = build_tile(&cfg, centre).unwrap();
+
+    let extras = &glb_json(&glb)["extras"];
+    assert!(
+        extras["normals_source_zoom"].is_null(),
+        "synthesized normals record null: {extras}"
+    );
+    // the walk 10 → 1 leaves a marker per zoom, so it never repeats
+    assert!(dir.path().join("normals/10/500/400.png.404").exists());
+    assert_eq!(srv.hits.lock().unwrap().len(), 10);
+    let glb2 = build_tile(&cfg, centre).unwrap();
+    assert_eq!(
+        glb, glb2,
+        "second build must be identical and marker-served"
+    );
+    assert_eq!(srv.hits.lock().unwrap().len(), 10, "markers short-circuit");
+
+    // seed_block's ramp rises 1 m per texel east and 0.5 m per texel south:
+    // the synthesized normal is the analytic surface normal of that plane
+    let normals = read_normals(&glb).unwrap();
+    let texel_m = centre.size_m() / 256.0;
+    let (gx, gz) = (1.0 / texel_m, 0.5 / texel_m);
+    let len = (gx * gx + 1.0 + gz * gz).sqrt();
+    let want = [(-gx / len) as f32, (1.0 / len) as f32, (-gz / len) as f32];
+    for n in &normals {
+        for a in 0..3 {
+            assert!((n[a] - want[a]).abs() < 1e-3, "{n:?} vs {want:?}");
+        }
+    }
+}
+
+#[test]
+fn no_normals_drops_the_attribute_and_the_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let centre = TileId::new(10, 500, 400).unwrap();
+    seed_block(dir.path(), centre);
+    let with = build_tile(
+        &offline_config(dir.path()).with_uniform_resolution(17),
+        centre,
+    )
+    .unwrap();
+    let mut cfg = offline_config(dir.path()).with_uniform_resolution(17);
+    cfg.include_normals = false;
+    let without = build_tile(&cfg, centre).unwrap();
+
+    assert!(read_normals(&without).is_none(), "no NORMAL attribute");
+    assert!(read_normals(&with).is_some());
+    assert!(without.len() < with.len(), "normals cost bytes");
+    let extras = &glb_json(&without)["extras"];
+    assert!(
+        extras.get("normals_source_zoom").is_none(),
+        "no normals key when disabled: {extras}"
     );
 }

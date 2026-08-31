@@ -142,7 +142,7 @@ impl Fetcher {
     pub fn clear_missing_markers(&self, kind: Option<Kind>, zoom: Option<u8>) -> Result<usize> {
         let kinds: Vec<Kind> = match kind {
             Some(k) => vec![k],
-            None => vec![Kind::Texture, Kind::Heightmap],
+            None => vec![Kind::Texture, Kind::Heightmap, Kind::Normals],
         };
         let mut removed = 0;
         for k in kinds {

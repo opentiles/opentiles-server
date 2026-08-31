@@ -36,6 +36,19 @@ const LINEAR_MIPMAP_LINEAR: u32 = 9987;
 /// in the opposite edge of its own texture.
 const CLAMP_TO_EDGE: u32 = 33071;
 
+/// Where a tile's normals came from — recorded in the `extras` and deciding
+/// whether the mesh carries a NORMAL attribute at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NormalsOrigin {
+    /// Normals disabled: no NORMAL attribute, no `extras` entry.
+    Omitted,
+    /// Synthesized from the height field (`extras.normals_source_zoom` is
+    /// `null`).
+    Heights,
+    /// The provider's normal tile at this zoom.
+    Provider(u8),
+}
+
 /// Metadata recorded in the GLB root `extras` so a consumer can place and
 /// attribute the tile without out-of-band knowledge.
 #[derive(Clone, Debug)]
@@ -52,6 +65,8 @@ pub struct TileMeta {
     pub terrain_source_zoom: u8,
     /// Zoom the imagery was taken from (`== tile.zoom` when served directly).
     pub imagery_source_zoom: u8,
+    /// Where the normals came from (provider zoom, heights, or omitted).
+    pub normals: NormalsOrigin,
     /// Imagery attribution.
     pub imagery_attribution: String,
     /// Elevation attribution.
@@ -79,6 +94,16 @@ pub fn write_glb(grid: &Grid, jpeg: &[u8], meta: &TileMeta) -> Vec<u8> {
         Some(8),
     );
 
+    let nrm_view = (!grid.normals.is_empty()).then(|| {
+        push_view(
+            &mut bin,
+            &mut views,
+            &f32_bytes(grid.normals.iter().flatten()),
+            Some(ARRAY_BUFFER),
+            Some(12),
+        )
+    });
+
     let (index_bytes, index_type) = if grid.fits_u16() {
         (
             grid.indices
@@ -104,28 +129,40 @@ pub fn write_glb(grid: &Grid, jpeg: &[u8], meta: &TileMeta) -> Vec<u8> {
     pad_to_4(&mut bin, 0);
 
     // --- json chunk ---------------------------------------------------------
+    // accessors: 0 POSITION, 1 TEXCOORD_0, [2 NORMAL when present], last SCALAR
+    let mut accessors = vec![
+        json!({
+            "bufferView": pos_view, "componentType": FLOAT, "count": grid.positions.len(),
+            "type": "VEC3", "min": grid.min, "max": grid.max,
+        }),
+        json!({
+            "bufferView": uv_view, "componentType": FLOAT, "count": grid.uvs.len(),
+            "type": "VEC2",
+        }),
+    ];
+    let mut attributes = json!({ "POSITION": 0, "TEXCOORD_0": 1 });
+    if let Some(view) = nrm_view {
+        attributes["NORMAL"] = json!(accessors.len());
+        accessors.push(json!({
+            "bufferView": view, "componentType": FLOAT, "count": grid.normals.len(),
+            "type": "VEC3",
+        }));
+    }
+    let idx_accessor = accessors.len();
+    accessors.push(json!({
+        "bufferView": idx_view, "componentType": index_type, "count": grid.indices.len(),
+        "type": "SCALAR",
+    }));
+
     let b = meta.tile.bounds();
-    let doc = json!({
+    let mut doc = json!({
         "asset": {
             "version": "2.0",
             "generator": concat!("open-tiles ", env!("CARGO_PKG_VERSION")),
         },
         "buffers": [{ "byteLength": bin.len() }],
         "bufferViews": views,
-        "accessors": [
-            {
-                "bufferView": pos_view, "componentType": FLOAT, "count": grid.positions.len(),
-                "type": "VEC3", "min": grid.min, "max": grid.max,
-            },
-            {
-                "bufferView": uv_view, "componentType": FLOAT, "count": grid.uvs.len(),
-                "type": "VEC2",
-            },
-            {
-                "bufferView": idx_view, "componentType": index_type, "count": grid.indices.len(),
-                "type": "SCALAR",
-            },
-        ],
+        "accessors": accessors,
         "images": [{ "bufferView": img_view, "mimeType": "image/jpeg" }],
         "samplers": [{
             "magFilter": LINEAR, "minFilter": LINEAR_MIPMAP_LINEAR,
@@ -143,8 +180,8 @@ pub fn write_glb(grid: &Grid, jpeg: &[u8], meta: &TileMeta) -> Vec<u8> {
         "meshes": [{
             "name": meta.tile.to_string(),
             "primitives": [{
-                "attributes": { "POSITION": 0, "TEXCOORD_0": 1 },
-                "indices": 2,
+                "attributes": attributes,
+                "indices": idx_accessor,
                 "material": 0,
                 "mode": 4,
             }],
@@ -171,6 +208,11 @@ pub fn write_glb(grid: &Grid, jpeg: &[u8], meta: &TileMeta) -> Vec<u8> {
             },
         },
     });
+    match meta.normals {
+        NormalsOrigin::Omitted => {}
+        NormalsOrigin::Heights => doc["extras"]["normals_source_zoom"] = json!(null),
+        NormalsOrigin::Provider(z) => doc["extras"]["normals_source_zoom"] = json!(z),
+    }
     let mut json_bytes = serde_json::to_vec(&doc).expect("static json shape");
     pad_to_4(&mut json_bytes, b' ');
 

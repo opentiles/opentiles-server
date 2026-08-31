@@ -38,6 +38,27 @@ pub fn imagery_jpeg() -> Vec<u8> {
     out
 }
 
+/// Encode tile-frame normals (x east, y up, z south) as a 256×256 tilezen
+/// normal tile: `r = x`, `g = −z` (north), `b = y`, mapped [−1, 1] → [0, 255].
+pub fn normal_png(n: impl Fn(u32, u32) -> [f64; 3]) -> Vec<u8> {
+    let mut img = RgbImage::new(256, 256);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let v = n(x, y);
+        let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let b = |c: f64| ((c / len + 1.0) / 2.0 * 255.0).round().clamp(0.0, 255.0) as u8;
+        *p = image::Rgb([b(v[0]), b(-v[2]), b(v[1])]);
+    }
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(Cursor::new(&mut out))
+        .write_image(img.as_raw(), 256, 256, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    out
+}
+
+/// The constant normal `seed_block` seeds — deliberately different from the
+/// ramp's height-derived normal, so tests can tell provider from synth.
+pub const SEEDED_NORMAL: [f64; 3] = [0.6, 0.8, 0.0];
+
 /// A 256×256 PNG imagery tile (exercises the PNG → JPEG re-encode path).
 pub fn imagery_png() -> Vec<u8> {
     let img = RgbImage::from_fn(256, 256, |x, y| image::Rgb([x as u8, y as u8, 200]));
@@ -101,6 +122,9 @@ pub fn seed_block_into(store: &dyn open_tiles::Store, centre: TileId) {
             let key = |kind: &str| format!("{kind}/{}/{}/{}.png", t.zoom, t.x, t.y);
             store.put(&key("heightmap"), &png).unwrap();
             store.put(&key("texture"), &imagery_jpeg()).unwrap();
+            store
+                .put(&key("normals"), &normal_png(|_, _| SEEDED_NORMAL))
+                .unwrap();
         }
     }
 }

@@ -2,9 +2,11 @@
 //! zoom) → decode → grid → GLB.
 
 use crate::fetch::{Closest, Fetcher, Origin};
+use crate::glb::NormalsOrigin;
 use crate::glb::{write_glb, TileMeta};
 use crate::imagery;
 use crate::mesh::{build_grid, check_resolution, useful_ceiling, ZOOM_LEVELS};
+use crate::normals::NormalMap;
 use crate::provider::{Kind, Provider};
 use crate::store::{LocalStore, Store};
 use crate::terrain::{decode_heightmap_png, HeightField};
@@ -36,6 +38,11 @@ pub struct Config {
     /// JPEG quality used when imagery has to be encoded (PNG input, or
     /// derived from an ancestor).
     pub jpeg_quality: u8,
+    /// Emit per-vertex normals: fetched from the normals provider, or
+    /// synthesized from the heights where it has nothing (see
+    /// [`normals`](crate::normals)). Off drops the fetch and the NORMAL
+    /// attribute entirely.
+    pub include_normals: bool,
 }
 
 impl Default for Config {
@@ -47,6 +54,7 @@ impl Default for Config {
             connect_timeout: Duration::from_secs(5),
             read_timeout: Duration::from_secs(10),
             jpeg_quality: 90,
+            include_normals: true,
         }
     }
 }
@@ -92,6 +100,10 @@ pub struct TileInputs {
     pub jpeg: Vec<u8>,
     /// The tile the imagery came from (`== tile` or an ancestor).
     pub imagery_source: TileId,
+    /// The provider's normal map windowed onto `tile`, with the tile it
+    /// came from — or `None` (no zoom had one, or normals are disabled):
+    /// the build then synthesizes normals from `height`.
+    pub normals: Option<(NormalMap, TileId)>,
     /// How many of the source tile's 8 neighbours contributed a pad ring.
     pub neighbours_present: usize,
 }
@@ -109,13 +121,19 @@ pub fn load_inputs(cfg: &Config, tile: TileId) -> Result<TileInputs> {
     let fetcher = &fetcher;
 
     // resolve the height source first: the neighbour set depends on it
-    let (imagery, height_src) = std::thread::scope(|s| {
+    let (imagery, normals, height_src) = std::thread::scope(|s| {
         let imagery = s.spawn(move || fetch_imagery(fetcher, cfg, tile));
+        let normals = s.spawn(move || fetch_normals(fetcher, cfg, tile));
         let height = fetch_closest_logged(fetcher, &cfg.provider, Kind::Heightmap, tile);
-        (imagery.join().expect("fetch thread panicked"), height)
+        (
+            imagery.join().expect("fetch thread panicked"),
+            normals.join().expect("fetch thread panicked"),
+            height,
+        )
     });
     let height_src = height_src?;
     let (jpeg, imagery_source) = imagery?;
+    let normals = normals?;
     let source = height_src.source;
     let centre = decode_heightmap_png(&height_src.bytes, &format!("heightmap {source}"))?;
 
@@ -164,6 +182,7 @@ pub fn load_inputs(cfg: &Config, tile: TileId) -> Result<TileInputs> {
         terrain_source: source,
         jpeg,
         imagery_source,
+        normals,
         neighbours_present,
     })
 }
@@ -188,7 +207,33 @@ pub fn build_tile(cfg: &Config, tile: TileId) -> Result<Vec<u8>> {
         );
     }
 
-    let grid = build_grid(&inputs.height, tile.size_m(), resolution)?;
+    let normals_origin = match (&inputs.normals, cfg.include_normals) {
+        (_, false) => NormalsOrigin::Omitted,
+        (Some((_, source)), true) => NormalsOrigin::Provider(source.zoom),
+        (None, true) => NormalsOrigin::Heights,
+    };
+    let source_size_m = inputs.terrain_source.size_m();
+    /// Per-vertex normal source, boxed so both arms fit one call site.
+    type NormalAt = Box<dyn Fn(f64, f64) -> [f32; 3]>;
+    let normal_at: Option<NormalAt> = match &normals_origin {
+        NormalsOrigin::Omitted => None,
+        NormalsOrigin::Provider(_) => {
+            let map = inputs.normals.as_ref().expect("checked Provider").0.clone();
+            Some(Box::new(move |u, v| map.sample(u, v)))
+        }
+        NormalsOrigin::Heights => {
+            let field = inputs.height.clone();
+            Some(Box::new(move |u, v| {
+                crate::normals::from_heights(&field, u, v, source_size_m)
+            }))
+        }
+    };
+    let grid = build_grid(
+        &inputs.height,
+        tile.size_m(),
+        resolution,
+        normal_at.as_deref(),
+    )?;
     let meta = TileMeta {
         tile,
         tile_size_m: tile.size_m(),
@@ -196,17 +241,23 @@ pub fn build_tile(cfg: &Config, tile: TileId) -> Result<Vec<u8>> {
         resolution_requested: (resolution < requested).then_some(requested),
         terrain_source_zoom: inputs.terrain_source.zoom,
         imagery_source_zoom: inputs.imagery_source.zoom,
+        normals: normals_origin,
         imagery_attribution: cfg.provider.imagery_attribution.clone(),
         elevation_attribution: cfg.provider.elevation_attribution.clone(),
     };
     let glb = write_glb(&grid, &inputs.jpeg, &meta);
     log::info!(
-        "built {tile}: {} vertices, {} triangles, {} bytes (heights z{}, imagery z{}; inputs {:?}, mesh+glb {:?}, {} neighbours)",
+        "built {tile}: {} vertices, {} triangles, {} bytes (heights z{}, imagery z{}, normals {}; inputs {:?}, mesh+glb {:?}, {} neighbours)",
         grid.positions.len(),
         grid.triangles(),
         glb.len(),
         inputs.terrain_source.zoom,
         inputs.imagery_source.zoom,
+        match meta.normals {
+            NormalsOrigin::Omitted => "off".to_string(),
+            NormalsOrigin::Heights => "from heights".to_string(),
+            NormalsOrigin::Provider(z) => format!("z{z}"),
+        },
         t1 - t0,
         t1.elapsed(),
         inputs.neighbours_present,
@@ -234,6 +285,35 @@ fn fetch_closest_logged(
         );
     }
     Ok(c)
+}
+
+/// The provider's normal map for `tile`, from the closest provided zoom,
+/// windowed onto the tile. `Ok(None)` when normals are disabled or no zoom
+/// has one — the build then synthesizes from the heights. Like everywhere
+/// else, only a 404 walks/falls back; a transient error fails the build so
+/// a degraded tile is never cached.
+fn fetch_normals(
+    fetcher: &Fetcher,
+    cfg: &Config,
+    tile: TileId,
+) -> Result<Option<(NormalMap, TileId)>> {
+    if !cfg.include_normals {
+        return Ok(None);
+    }
+    let c = match fetch_closest_logged(fetcher, &cfg.provider, Kind::Normals, tile) {
+        Ok(c) => c,
+        Err(Error::NotFound { url }) => {
+            log::info!("normals {tile}: nothing upstream ({url}); deriving from heights");
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let map = NormalMap::decode(&c.bytes, &format!("normals {}", c.source))?;
+    let (_, qx, qy) = tile.ancestor(c.source.zoom);
+    Ok(Some((
+        map.windowed(tile.zoom - c.source.zoom, qx, qy),
+        c.source,
+    )))
 }
 
 /// Imagery bytes as JPEG for `tile`, from the closest provided zoom.

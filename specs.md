@@ -2,16 +2,16 @@
 
 | | |
 |---|---|
-| **Status** | Draft, version 1 |
-| **Date** | 2026-08-30 |
-| **Applies to** | open-tiles 0.1.x (`asset.generator` = `open-tiles 0.1.0`) |
+| **Status** | Draft, version 2 |
+| **Date** | 2026-08-31 |
+| **Applies to** | open-tiles 0.2.x (`asset.generator` = `open-tiles 0.2.0`) |
 | **Editor** | Ziv Perry |
 
 ## Abstract
 
 This document specifies the **open-tiles terrain tile**: a self-contained glTF 2.0 binary
 (GLB) that carries the terrain of one Web Mercator slippy-map tile as real geometry, at 1:1
-world scale, with satellite imagery as its texture. It defines how tiles are addressed, the
+world scale, with satellite imagery as its texture and per-vertex normals. It defines how tiles are addressed, the
 coordinate frame and scale a consumer can rely on, the mesh, height and imagery construction
 rules that make neighbouring tiles fit together without cracks, the exact GLB layout and its
 metadata, the behaviour when source data is missing at a zoom, and the HTTP interface that
@@ -31,8 +31,8 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHOULD", "SHOULD NOT",
 - **Server** — the HTTP service that builds tiles on demand and caches them.
 - **Consumer** — anything loading a tile GLB (a game engine, three.js, a GIS viewer).
 - **Provider** — an upstream HTTP source of raw inputs (heightmaps, imagery).
-- **Source zoom** — the zoom the heightmap or imagery for a tile was actually taken from;
-  equal to the tile's zoom unless the provider had nothing there (§6).
+- **Source zoom** — the zoom the heightmap, imagery or normal map for a tile was actually
+  taken from; equal to the tile's zoom unless the provider had nothing there (§6).
 - **Texel** — one sample of a 256×256 source image.
 - `S` — the tile's edge length in metres (§3.3). `R` — vertices per mesh edge (§4.2).
 - `n = 2^zoom` — tiles per axis at a zoom.
@@ -204,9 +204,51 @@ indices.
 
 ### 4.6 Normals
 
-Tiles carry **no normals, no tangents, no skirts**. Consumers compute flat or smooth normals as
-they see fit. Level-of-detail seams between tiles of different zooms are the consumer's
-responsibility.
+Unless normals are disabled in the producer's configuration, every vertex carries a **unit
+`NORMAL`** in the tile frame of §3.1 (+X east, +Y up, +Z south; `Y` component always positive
+for terrain). The normal for vertex `(u, v)` comes from one of two sources, recorded in
+`extras.normals_source_zoom` (§8.6):
+
+**1. Provider normal map (preferred).** A third asset kind next to imagery and heightmaps: a
+square normal-map tile (tilezen `normal` by default, 256×256), subject to the same
+closest-provided-zoom fallback and windowing as the other assets (§6, §2.3). A map texel
+decodes as
+
+```
+n_map = rgb / 255 · 2 − 1          (a unit vector; any alpha channel is ignored —
+                                    tilezen stores quantized elevation there)
+```
+
+whose axes are **r = east, g = north, b = up**; in the tile frame that is
+
+```
+n = normalize( (r', b', −g') )     with (r', g', b') = n_map components
+```
+
+Vertex values are sampled bilinearly with texel centres at `(i + 0.5) / size`, through the
+window for derived tiles, renormalized after interpolation. The map has **no pad ring**
+(unlike heights, §5.2): edge samples clamp, so a boundary vertex MAY shade up to half a texel
+differently from its neighbour tile — a shading nuance, not a geometric crack, and the same
+behaviour as the reference engines' clamp-to-edge samplers.
+
+**2. Synthesized from the heights.** When no zoom of the normals provider has the tile (the
+walk of §6 exhausts without a hit), the producer MUST derive normals from the padded height
+field instead — never emit flat or garbage normals. With `sample` the field sampling of
+§5.3/§5.4 in field space and `S_src` the metre size (§3.3) of the **terrain source** tile:
+
+```
+ε  = 1/512                                       (half a source texel, field space)
+gx = ( sample(fu + ε, fv) − sample(fu − ε, fv) ) / (2·ε·S_src)
+gz = ( sample(fu, fv + ε) − sample(fu, fv − ε) ) / (2·ε·S_src)
+n  = normalize( (−gx, 1, −gz) )
+```
+
+Because the differences read the padded field, synthesized normals are watertight wherever the
+heights are (§5.5).
+
+Tiles carry **no tangents and no skirts**. Level-of-detail seams between tiles of different
+zooms remain the consumer's responsibility. A consumer MAY ignore or recompute normals; when
+present they satisfy glTF's unit-length requirement.
 
 ## 5. Heights
 
@@ -290,8 +332,8 @@ ancestor and across the ancestor's own edges (through its pad ring).
 
 ## 6. Source fallback ("closest provided zoom")
 
-Providers do not cover every zoom (Terrarium stops at 15; Esri imagery at ~19). For each asset
-kind (heightmap, imagery) independently, the builder:
+Providers do not cover every zoom (Terrarium and tilezen normals stop at 15; Esri imagery at
+~19). For each asset kind (heightmap, imagery, normals) independently, the builder:
 
 1. starts at `z₀ = max( min(zoom, hint), 1 )`, where `hint` is the provider's
    *most-provided-zoom* (`heightmap_max_zoom`, default 15; `texture_max_zoom`, default 19);
@@ -301,11 +343,14 @@ kind (heightmap, imagery) independently, the builder:
 4. on **any error other than 404** (timeout, 5xx, connection refused) aborts the build with a
    `Fetch` error. A transient failure MUST NOT change which zoom a tile is derived from.
 
-If nothing exists at any zoom the result is `NotFound` (HTTP 404, CLI exit 3).
+If nothing exists at any zoom: for **heights or imagery** the result is `NotFound` (HTTP 404,
+CLI exit 3); for **normals** the tile is still built, with normals synthesized from the
+heights (§4.6) — a missing decoration must not fail the terrain. `hint` for normals is
+`normals_max_zoom` (default 15).
 
-The hint only avoids requests known to fail; a 404 *below* the hint keeps walking. Heights and
-imagery may resolve to different source zooms (`extras.terrain_source_zoom`,
-`extras.imagery_source_zoom`).
+The hint only avoids requests known to fail; a 404 *below* the hint keeps walking. The three
+assets may resolve to different source zooms (`extras.terrain_source_zoom`,
+`extras.imagery_source_zoom`, `extras.normals_source_zoom`).
 
 ## 7. Imagery
 
@@ -331,7 +376,8 @@ kernels only invent edges. An ancestor smaller than `2^dz` texels per axis is an
 ## 8. GLB container
 
 A tile is a **glTF 2.0 binary** (`.glb`) with exactly one buffer, one mesh, one primitive, one
-material, one texture, one image, one node and one scene. No extensions are used or required.
+material, one texture, one image, one node and one scene; the primitive has a `NORMAL`
+attribute unless normals are disabled. No extensions are used or required.
 Consumers MAY rely on the layout below; producers MUST emit it.
 
 ### 8.1 Header and chunks
@@ -360,16 +406,21 @@ offset (padding bytes are zero):
 |---|---|---|---|
 | 0 | positions, `R²` × 3 × `f32` LE | 34962 (ARRAY_BUFFER) | 12 |
 | 1 | UVs, `R²` × 2 × `f32` LE | 34962 | 8 |
-| 2 | indices, `(R−1)²·6` × `u16` or `u32` LE | 34963 (ELEMENT_ARRAY_BUFFER) | — |
-| 3 | the JPEG bytes (§7) | — | — |
+| 2* | normals, `R²` × 3 × `f32` LE (when present) | 34962 | 12 |
+| next | indices, `(R−1)²·6` × `u16` or `u32` LE | 34963 (ELEMENT_ARRAY_BUFFER) | — |
+| last | the JPEG bytes (§7) | — | — |
+
+\* The normals view exists only when the tile carries normals; the indices and image views
+then shift by one. Consumers MUST resolve views through the accessors, not by fixed index.
 
 ### 8.3 Accessors
 
-| index | bufferView | componentType | type | count | notes |
+| index | semantic | componentType | type | count | notes |
 |---|---|---|---|---|---|
-| 0 | 0 | 5126 FLOAT | VEC3 | `R²` | `min`/`max` present (per-axis bounds of positions) |
-| 1 | 1 | 5126 FLOAT | VEC2 | `R²` | |
-| 2 | 2 | 5123 UNSIGNED_SHORT or 5125 UNSIGNED_INT | SCALAR | `(R−1)²·6` | §4.5 |
+| 0 | POSITION | 5126 FLOAT | VEC3 | `R²` | `min`/`max` present (per-axis bounds of positions) |
+| 1 | TEXCOORD_0 | 5126 FLOAT | VEC2 | `R²` | |
+| 2* | NORMAL | 5126 FLOAT | VEC3 | `R²` | only when the tile carries normals (§4.6) |
+| last | indices | 5123 UNSIGNED_SHORT or 5125 UNSIGNED_INT | SCALAR | `(R−1)²·6` | §4.5 |
 
 Accessor 0's `min`/`max` give the tile's bounding box directly; `min[1]`/`max[1]` are the
 lowest and highest vertex in metres above sea level.
@@ -397,8 +448,8 @@ information.
 
 ```json
 "meshes": [{ "name": "<zoom>/<x>/<y>",
-             "primitives": [{ "attributes": { "POSITION": 0, "TEXCOORD_0": 1 },
-                              "indices": 2, "material": 0, "mode": 4 }] }],
+             "primitives": [{ "attributes": { "POSITION": 0, "TEXCOORD_0": 1, "NORMAL": 2 },
+                              "indices": 3, "material": 0, "mode": 4 }] }],
 "nodes":  [{ "name": "<zoom>/<x>/<y>", "mesh": 0 }],
 "scenes": [{ "nodes": [0] }],
 "scene":  0,
@@ -421,6 +472,7 @@ no out-of-band knowledge:
 | `resolution_requested` | integer or `null` | configured `R` when it was capped, else `null` |
 | `terrain_source_zoom` | integer | zoom the heights came from (§6) |
 | `imagery_source_zoom` | integer | zoom the imagery came from (§6) |
+| `normals_source_zoom` | integer or `null` | zoom the normal map came from; `null` when synthesized from the heights (§4.6); **absent** when the tile carries no normals |
 | `units` | string | always `"metres"` |
 | `up` | string | always `"+Y"` |
 | `origin` | string | human-readable frame statement (§3.1) |
@@ -516,6 +568,7 @@ Both cache tiers share one key space, served by a local directory or an S3 bucke
 texture/{zoom}/{x}/{y}.png          raw imagery as received (JPEG bytes may live under .png;
                                     readers sniff the format)
 heightmap/{zoom}/{x}/{y}.png        raw Terrarium PNG as received
+normals/{zoom}/{x}/{y}.png          raw normal-map PNG as received
 {kind}/{zoom}/{x}/{y}.png.404       zero-byte marker: the provider answered 404
 glb/{fingerprint}/{zoom}/{x}/{y}.glb   built tile (server output cache)
 ```
@@ -536,7 +589,9 @@ characters of **BLAKE3** over, in order:
 2. the 22 resolution-table entries, each as little-endian `u32`;
 3. the imagery URL template, UTF-8, followed by a `0x00` byte;
 4. the heightmap URL template, UTF-8, followed by a `0x00` byte;
-5. the three bytes `texture_max_zoom`, `heightmap_max_zoom`, `jpeg_quality`.
+5. the normals URL template, UTF-8, followed by a `0x00` byte;
+6. the five bytes `texture_max_zoom`, `heightmap_max_zoom`, `normals_max_zoom`,
+   `jpeg_quality`, `include_normals` (0 or 1).
 
 Everything that can change the bytes of a tile is included; cache location, timeouts and
 concurrency are not. Old `glb/<fingerprint>/` trees can simply be deleted.
@@ -550,6 +605,7 @@ each token is replaced (identical semantics to the engines). Defaults:
 |---|---|---|
 | imagery | `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/:zoom:/:y:/:x:` | 19 |
 | heightmap | `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/:zoom:/:x:/:y:.png` | 15 |
+| normals | `https://s3.amazonaws.com/elevation-tiles-prod/normal/:zoom:/:x:/:y:.png` | 15 |
 
 Esri's `zoom/y/x` order is how that service encodes its URLs and is intentional. Responses are
 capped at 32 MiB; an empty body is a fetch error.
@@ -572,23 +628,27 @@ attribution strings.
 
 ## 14. Versioning
 
-This is **version 1** of the tile format, produced by open-tiles 0.1.x. Changes that alter
-tile bytes for the same inputs (formulas, resolution table, JPEG quality, GLB layout) MUST bump
-the crate version, which changes the fingerprint and thus every ETag and output-cache key.
-Additive metadata (new `extras` fields, new service-description fields) is backward compatible.
+This is **version 2** of the tile format, produced by open-tiles 0.2.x. Version 2 adds
+per-vertex normals (§4.6): the `NORMAL` attribute, the `normals` cache/provider asset, the
+`extras.normals_source_zoom` field, and the extended fingerprint input list of §10.2 —
+version-1 tiles remain valid under their own fingerprint. Changes that alter tile bytes for
+the same inputs (formulas, resolution table, JPEG quality, GLB layout) MUST bump the crate
+version, which changes the fingerprint and thus every ETag and output-cache key. Additive
+metadata (new `extras` fields, new service-description fields) is backward compatible.
 
 ## Appendix A. Worked example
 
 Tile `12/772/1607` (Grand Canyon, default configuration):
 
 - centre latitude ≈ 36.1° N → `S ≈ 7 908.657 m`;
-- heights and imagery both at source zoom 12 (`dz = 0`), `R = 129`: 16 641 vertices,
+- heights, imagery and normals all at source zoom 12 (`dz = 0`), `R = 129`: 16 641 vertices,
   32 768 triangles, 16-bit indices;
-- GLB ≈ 548 KB, of which the mesh is ≈ 0.5 MB and the JPEG the rest;
-- `ETag: "e990d5eb222b8eb1-548816"` for open-tiles 0.1.0 with default settings.
+- GLB ≈ 748 KB: positions + normals ≈ 200 KB each, UVs ≈ 130 KB, indices ≈ 66 KB, the JPEG
+  the rest;
+- `ETag: "5602faf3396ecac2-748692"` for open-tiles 0.2.0 with default settings.
 
-Tile `20/790547/411413` (same defaults): heights derive from zoom 15 (`dz = 5` → ceiling 9),
-imagery from zoom 19 (`dz = 1`); `R_used = 9` (configured 9, not capped); ≈ 7 KB.
+Tile `20/790547/411413` (same defaults): heights and normals derive from zoom 15 (`dz = 5` →
+ceiling 9), imagery from zoom 19 (`dz = 1`); `R_used = 9` (configured 9, not capped); ≈ 8 KB.
 
 ## Appendix B. Consumer checklist
 
@@ -596,6 +656,7 @@ imagery from zoom 19 (`dz = 1`); `R_used = 9` (configured 9, not capped); ≈ 7 
 2. Read `extras.zoom/x/y` and `extras.tile_size_m`.
 3. Place the node at `(dx · G, 0, dy · G)` and scale it by `G / tile_size_m` in X and Z
    (§3.4, strategy 2) — never scale Y.
-4. Compute normals if lighting is wanted; the material is plain PBR and can be swapped.
+4. Use the embedded per-vertex normals for lighting (or recompute your own — they are an
+   attribute like any other); the material is plain PBR and can be swapped.
 5. Cache by URL; honour `ETag` / `immutable`.
 6. Display `extras.sources`.

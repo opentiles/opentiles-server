@@ -17,12 +17,18 @@ pub struct Provider {
     pub texture_url: String,
     /// Terrarium heightmap URL template (`zoom/x/y`).
     pub heightmap_url: String,
+    /// Normal-map URL template (`zoom/x/y`) — tilezen `normal` tiles by
+    /// default, the dataset the engines shade with.
+    pub normals_url: String,
     /// Deepest zoom the imagery provider serves nearly everywhere (Esri: 19;
     /// deeper exists in cities). Start point of the fallback walk.
     pub texture_max_zoom: u8,
     /// Deepest zoom the heightmap provider serves (Mapzen Terrarium: 15).
     /// Start point of the fallback walk.
     pub heightmap_max_zoom: u8,
+    /// Deepest zoom the normals provider serves (tilezen `normal`: 15,
+    /// same coverage as Terrarium). Start point of the fallback walk.
+    pub normals_max_zoom: u8,
     /// Attribution strings recorded in the GLB `extras`.
     pub imagery_attribution: String,
     /// See `imagery_attribution`.
@@ -36,8 +42,11 @@ impl Default for Provider {
                 "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/:zoom:/:y:/:x:"
                     .into(),
             heightmap_url: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/:zoom:/:x:/:y:.png".into(),
+            normals_url: "https://s3.amazonaws.com/elevation-tiles-prod/normal/:zoom:/:x:/:y:.png"
+                .into(),
             texture_max_zoom: 19,
             heightmap_max_zoom: 15,
+            normals_max_zoom: 15,
             imagery_attribution: "Esri World Imagery".into(),
             elevation_attribution: "Mapzen Terrain Tiles (Terrarium) on AWS Open Data".into(),
         }
@@ -51,6 +60,8 @@ pub enum Kind {
     Texture,
     /// Terrarium-encoded heightmap (PNG).
     Heightmap,
+    /// Normal-map tile (PNG, tilezen encoding).
+    Normals,
 }
 
 impl Kind {
@@ -59,6 +70,7 @@ impl Kind {
         match self {
             Kind::Texture => "texture",
             Kind::Heightmap => "heightmap",
+            Kind::Normals => "normals",
         }
     }
 
@@ -67,6 +79,7 @@ impl Kind {
         match self {
             Kind::Texture => "imagery",
             Kind::Heightmap => "heightmap",
+            Kind::Normals => "normals",
         }
     }
 }
@@ -77,6 +90,7 @@ impl Provider {
         let template = match kind {
             Kind::Texture => &self.texture_url,
             Kind::Heightmap => &self.heightmap_url,
+            Kind::Normals => &self.normals_url,
         };
         expand_url(template, tile)
     }
@@ -86,6 +100,7 @@ impl Provider {
         match kind {
             Kind::Texture => self.texture_max_zoom,
             Kind::Heightmap => self.heightmap_max_zoom,
+            Kind::Normals => self.normals_max_zoom,
         }
     }
 }

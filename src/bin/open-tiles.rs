@@ -82,12 +82,21 @@ struct ProviderArgs {
     /// Heightmap URL template (:zoom:/:x:/:y: tokens).
     #[arg(long)]
     heightmap_url: Option<String>,
+    /// Normal-map URL template (:zoom:/:x:/:y: tokens).
+    #[arg(long)]
+    normals_url: Option<String>,
     /// Deepest zoom to ask the imagery provider for before deriving (default 19).
     #[arg(long)]
     texture_max_zoom: Option<u8>,
     /// Deepest zoom to ask the heightmap provider for before deriving (default 15).
     #[arg(long)]
     heightmap_max_zoom: Option<u8>,
+    /// Deepest zoom to ask the normals provider for before deriving (default 15).
+    #[arg(long)]
+    normals_max_zoom: Option<u8>,
+    /// Skip normals entirely: no provider fetch, no NORMAL attribute.
+    #[arg(long)]
+    no_normals: bool,
     /// HTTP read timeout in seconds for upstream fetches.
     #[arg(long, default_value_t = 10)]
     timeout: u64,
@@ -104,12 +113,19 @@ impl ProviderArgs {
         if let Some(u) = self.heightmap_url {
             cfg.provider.heightmap_url = u;
         }
+        if let Some(u) = self.normals_url {
+            cfg.provider.normals_url = u;
+        }
         if let Some(z) = self.texture_max_zoom {
             cfg.provider.texture_max_zoom = z;
         }
         if let Some(z) = self.heightmap_max_zoom {
             cfg.provider.heightmap_max_zoom = z;
         }
+        if let Some(z) = self.normals_max_zoom {
+            cfg.provider.normals_max_zoom = z;
+        }
+        cfg.include_normals = !self.no_normals;
     }
 }
 
@@ -153,6 +169,8 @@ enum AssetKind {
     Texture,
     /// Heightmap markers only.
     Heightmap,
+    /// Normal-map markers only.
+    Normals,
 }
 
 /// Arguments of `open-tiles refresh-404`.
@@ -284,6 +302,7 @@ fn run_refresh(a: RefreshArgs) -> i32 {
     let kind = a.kind.map(|k| match k {
         AssetKind::Texture => Kind::Texture,
         AssetKind::Heightmap => Kind::Heightmap,
+        AssetKind::Normals => Kind::Normals,
     });
     match f.clear_missing_markers(kind, a.zoom) {
         Ok(n) => {
