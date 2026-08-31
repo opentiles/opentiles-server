@@ -10,17 +10,30 @@ use crate::mesh::Grid;
 use crate::tile::TileId;
 use serde_json::json;
 
-const GLB_MAGIC: u32 = 0x4654_6C67; // "glTF"
+/// GLB container magic: the ASCII bytes "glTF" read as a little-endian u32.
+const GLB_MAGIC: u32 = 0x4654_6C67;
+/// Chunk-type tag of the (first, mandatory) JSON chunk: "JSON".
 const CHUNK_JSON: u32 = 0x4E4F_534A;
+/// Chunk-type tag of the binary chunk: "BIN\0".
 const CHUNK_BIN: u32 = 0x004E_4942;
 
+// glTF enums are raw OpenGL numbers; named here so the JSON below is readable.
+/// `componentType`: 32-bit IEEE float (positions, UVs).
 const FLOAT: u32 = 5126;
+/// `componentType`: 16-bit index — used whenever the vertex count fits.
 const UNSIGNED_SHORT: u32 = 5123;
+/// `componentType`: 32-bit index — only the 257-vertex grids need it.
 const UNSIGNED_INT: u32 = 5125;
+/// bufferView `target` for vertex attributes.
 const ARRAY_BUFFER: u32 = 34962;
+/// bufferView `target` for triangle indices.
 const ELEMENT_ARRAY_BUFFER: u32 = 34963;
+/// Sampler magnification filter: bilinear.
 const LINEAR: u32 = 9729;
+/// Sampler minification filter: trilinear (interpolated mipmaps).
 const LINEAR_MIPMAP_LINEAR: u32 = 9987;
+/// Wrap mode: edge texels extend past 0/1, so a tile's border never bleeds
+/// in the opposite edge of its own texture.
 const CLAMP_TO_EDGE: u32 = 33071;
 
 /// Metadata recorded in the GLB root `extras` so a consumer can place and
@@ -176,6 +189,7 @@ pub fn write_glb(grid: &Grid, jpeg: &[u8], meta: &TileMeta) -> Vec<u8> {
     out
 }
 
+/// Flatten `f32`s into little-endian bytes (glTF buffers are always LE).
 fn f32_bytes<'a>(it: impl Iterator<Item = &'a f32>) -> Vec<u8> {
     it.flat_map(|v| v.to_le_bytes()).collect()
 }
@@ -203,6 +217,9 @@ fn push_view(
     views.len() - 1
 }
 
+/// Pad `buf` to a multiple of 4 bytes. GLB requires 4-byte alignment
+/// everywhere: spaces inside the JSON chunk (still valid JSON), zeros in
+/// binary data.
 fn pad_to_4(buf: &mut Vec<u8>, fill: u8) {
     while !buf.len().is_multiple_of(4) {
         buf.push(fill);

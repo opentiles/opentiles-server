@@ -37,7 +37,9 @@ pub const MISSING_MARKER_SUFFIX: &str = ".404";
 /// Cheap to clone; safe to share across threads.
 #[derive(Clone)]
 pub struct Fetcher {
+    /// Shared HTTP agent — one keep-alive connection pool for all fetches.
     agent: ureq::Agent,
+    /// Where fetched bytes are read from and written through to.
     store: Arc<dyn Store>,
 }
 
@@ -158,6 +160,10 @@ impl Fetcher {
         Ok(removed)
     }
 
+    /// GET `url` and buffer the whole body (capped at [`MAX_RESPONSE_BYTES`]).
+    /// HTTP 404 becomes the typed [`Error::NotFound`] the walk-down relies
+    /// on; any other status, transport failure or empty body is
+    /// [`Error::Fetch`].
     fn download(&self, url: &str) -> Result<Vec<u8>> {
         let resp = match self.agent.get(url).call() {
             Ok(r) => r,

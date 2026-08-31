@@ -1,4 +1,16 @@
 <!doctype html>
+<!--
+  Bundled demo viewer for open-tiles (served at /example/, also works from any
+  static server thanks to the tile server's CORS `*`).
+
+  Plain three.js, no build step: pick a lat/lon, zoom and an n×n block of
+  tiles, press Load. Each tile is one GLB fetched from /{z}/{x}/{y}.glb and
+  placed per specs.md §3.4 "uniform grid": tile (x, y) goes to
+  (dx·G, 0, dy·G) relative to the centre tile and is scaled by
+  G / extras.tile_size_m in X/Z only, so Mercator rows meet exactly.
+  Parameters live in the URL query (?lat=…&lon=…&zoom=…&n=…&grid) so views
+  are shareable. Orbit: drag · pan: right-drag · zoom: wheel.
+-->
 <html lang="en">
 <head>
 <meta charset="utf-8">

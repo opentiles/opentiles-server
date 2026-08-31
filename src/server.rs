@@ -73,14 +73,22 @@ pub fn output_key(fingerprint: &str, tile: TileId) -> String {
     format!("glb/{fingerprint}/{}/{}/{}.glb", tile.zoom, tile.x, tile.y)
 }
 
+/// What one build produced — the GLB bytes or the error to report — shared
+/// between the build's leader and every waiter (hence the `Arc`s).
 type Outcome = Result<Arc<[u8]>, Arc<Error>>;
 
 /// Shared state behind the handlers.
 pub struct AppState {
+    /// Builder configuration: providers, cache, resolution table.
     cfg: Arc<Config>,
+    /// Server-only settings: bind address, CORS, build concurrency.
     serve: ServeConfig,
+    /// Output-cache namespace and ETag prefix, computed once from `cfg`.
     fingerprint: String,
+    /// One entry per tile currently being built. A request finding its tile
+    /// here subscribes to the leader's channel instead of building again.
     inflight: Mutex<HashMap<TileId, watch::Receiver<Option<Outcome>>>>,
+    /// Bounds how many *different* tiles build at once (`max_builds`).
     builds: Semaphore,
 }
 
@@ -154,6 +162,10 @@ impl AppState {
         }
     }
 
+    /// Build `tile` as the sole leader and publish the bytes at `key` in
+    /// the output cache. Takes a build permit first (the global concurrency
+    /// bound) and runs the synchronous builder under `spawn_blocking` so
+    /// the async workers stay free.
     async fn lead_build(&self, tile: TileId, key: String) -> Outcome {
         let _permit = self.builds.acquire().await.expect("semaphore closed");
         let cfg = self.cfg.clone();
@@ -219,6 +231,8 @@ pub async fn run(cfg: Config, serve: ServeConfig) -> std::io::Result<()> {
 
 // -- handlers -------------------------------------------------------------------
 
+/// `GET /` — the service description: name, version, fingerprint, tile URL
+/// template, zoom range, resolution table, frame conventions, attribution.
 async fn index(State(state): State<Arc<AppState>>) -> Response {
     let cfg = &state.cfg;
     let body = json!({
@@ -269,6 +283,10 @@ async fn example(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
+/// `GET`/`HEAD` `/{z}/{x}/{y}.glb` — parse the address, get the bytes from
+/// [`AppState::tile`] (cache hit or deduplicated build), then handle the
+/// HTTP niceties: ETag / `If-None-Match` → 304, bodyless HEAD, immutable
+/// cache-control, and the error → status mapping.
 async fn tile(
     State(state): State<Arc<AppState>>,
     Path((z, x, y)): Path<(String, String, String)>,
@@ -348,6 +366,7 @@ fn parse_tile_path(z: &str, x: &str, y: &str) -> Result<TileId, String> {
     TileId::new(z, x, y).map_err(|e| e.to_string())
 }
 
+/// A JSON error body `{"error", "status"}` with the given cache policy.
 fn error_response(status: StatusCode, message: &str, cache: &'static str) -> Response {
     (
         status,
@@ -360,6 +379,8 @@ fn error_response(status: StatusCode, message: &str, cache: &'static str) -> Res
         .into_response()
 }
 
+/// Last step of every handler: attach `Access-Control-Allow-Origin: *`
+/// unless CORS was disabled.
 fn finish(cors: bool, mut resp: Response) -> Response {
     if cors {
         resp.headers_mut().insert(

@@ -53,6 +53,8 @@ pub fn derive_from_ancestor(
     encode_jpeg(&up, quality, what)
 }
 
+/// Detect the format from the magic bytes — never from a file name: the
+/// cache stores imagery under `.png` even when the provider sent JPEG.
 fn sniff(bytes: &[u8], what: &str) -> Result<ImageFormat> {
     image::guess_format(bytes).map_err(|e| Error::Decode {
         what: what.into(),
@@ -60,6 +62,7 @@ fn sniff(bytes: &[u8], what: &str) -> Result<ImageFormat> {
     })
 }
 
+/// Decode `bytes` as `format`, tagging failures with `what` for the error.
 fn decode(bytes: &[u8], format: ImageFormat, what: &str) -> Result<DynamicImage> {
     image::load_from_memory_with_format(bytes, format).map_err(|e| Error::Decode {
         what: what.into(),
@@ -67,6 +70,8 @@ fn decode(bytes: &[u8], format: ImageFormat, what: &str) -> Result<DynamicImage>
     })
 }
 
+/// Encode as baseline RGB JPEG at `quality` (any alpha channel is dropped —
+/// terrain imagery has no meaningful transparency).
 fn encode_jpeg(img: &DynamicImage, quality: u8, what: &str) -> Result<Vec<u8>> {
     let rgb = img.to_rgb8();
     let mut out = Vec::new();

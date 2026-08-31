@@ -21,14 +21,17 @@ use std::time::Duration;
     version,
     about = "3D terrain tiles as GLB, at 1:1 world scale"
 )]
+/// Top-level parser: the global verbosity flag plus one subcommand.
 struct Cli {
     /// Log fetches and timings (-v info, -vv debug).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
+    /// The operation to run.
     #[command(subcommand)]
     cmd: Cmd,
 }
 
+/// The four operations; each maps onto one `run_*` function below.
 #[derive(Subcommand)]
 enum Cmd {
     /// Build one tile and write it as a .glb file.
@@ -42,6 +45,7 @@ enum Cmd {
     Refresh404(RefreshArgs),
 }
 
+/// Arguments of `open-tiles build`.
 #[derive(Args)]
 struct BuildArgs {
     /// Zoom level (1..=22).
@@ -62,10 +66,14 @@ struct BuildArgs {
     /// per-zoom table and is capped by the height source's useful ceiling.
     #[arg(long)]
     resolution: Option<u32>,
+    /// Shared provider flags.
     #[command(flatten)]
     provider: ProviderArgs,
 }
 
+/// Provider flags shared by `build` and `serve`: URL templates, zoom
+/// hints, and the upstream read timeout. Unset flags keep the defaults
+/// from [`Provider::default`](open_tiles::Provider).
 #[derive(Args)]
 struct ProviderArgs {
     /// Imagery URL template (:zoom:/:x:/:y: tokens).
@@ -86,6 +94,8 @@ struct ProviderArgs {
 }
 
 impl ProviderArgs {
+    /// Copy every flag that was actually given onto `cfg`; absent flags
+    /// leave the defaults untouched.
     fn apply(self, cfg: &mut Config) {
         cfg.read_timeout = Duration::from_secs(self.timeout);
         if let Some(u) = self.texture_url {
@@ -103,6 +113,7 @@ impl ProviderArgs {
     }
 }
 
+/// Arguments of `open-tiles serve`.
 #[derive(Args)]
 struct ServeArgs {
     /// Address to listen on.
@@ -117,10 +128,12 @@ struct ServeArgs {
     /// Do not send Access-Control-Allow-Origin: *.
     #[arg(long)]
     no_cors: bool,
+    /// Shared provider flags.
     #[command(flatten)]
     provider: ProviderArgs,
 }
 
+/// Arguments of `open-tiles lookup`.
 #[derive(Args)]
 struct LookupArgs {
     /// Latitude in degrees.
@@ -133,15 +146,19 @@ struct LookupArgs {
     zoom: u8,
 }
 
+/// `--kind` values for `refresh-404`, mirroring [`Kind`].
 #[derive(Clone, Copy, ValueEnum)]
 enum AssetKind {
+    /// Imagery markers only.
     Texture,
+    /// Heightmap markers only.
     Heightmap,
 }
 
+/// Arguments of `open-tiles refresh-404`.
 #[derive(Args)]
 struct RefreshArgs {
-    /// Input cache root.
+    /// Cache holding the markers: a directory or s3://bucket[/prefix].
     #[arg(long, default_value = ".cache", env = "CACHE_DIR")]
     cache_dir: String,
     /// Only this zoom (default: all).
@@ -164,6 +181,9 @@ fn main() {
     std::process::exit(code);
 }
 
+/// `build`: build one tile, write the GLB to `--output` (default
+/// `./{zoom}-{x}-{y}.glb`), and map error kinds onto the documented exit
+/// codes (2 usage · 3 not found · 4 network/decode/IO).
 fn run_build(a: BuildArgs) -> i32 {
     let tile = match TileId::new(a.zoom, a.x, a.y) {
         Ok(t) => t,
@@ -202,6 +222,8 @@ fn run_build(a: BuildArgs) -> i32 {
     0
 }
 
+/// `lookup`: print which tile covers a lat/lon at a zoom — address,
+/// metre size, bounds, and a ready-to-paste `build` command.
 fn run_lookup(a: LookupArgs) -> i32 {
     let tile = match TileId::from_lat_lon(a.lat, a.lon, a.zoom) {
         Ok(t) => t,
@@ -221,6 +243,8 @@ fn run_lookup(a: LookupArgs) -> i32 {
     0
 }
 
+/// `serve`: open the cache (directory or S3), assemble the configs, and
+/// run the HTTP server on a fresh tokio runtime until Ctrl-C.
 fn run_serve(a: ServeArgs) -> i32 {
     let cache = match open_cache(&a.cache_dir) {
         Ok(c) => c,
@@ -249,6 +273,8 @@ fn run_serve(a: ServeArgs) -> i32 {
     }
 }
 
+/// `refresh-404`: delete negative-cache markers so the providers are
+/// asked again (e.g. after their coverage improved).
 fn run_refresh(a: RefreshArgs) -> i32 {
     let cache = match open_cache(&a.cache_dir) {
         Ok(c) => c,
@@ -273,6 +299,8 @@ fn open_cache(spec: &str) -> anyhow::Result<Arc<dyn Store>> {
     open_tiles::store::open(spec).with_context(|| format!("opening cache {spec}"))
 }
 
+/// The single error path of every subcommand: print `error: …` with the
+/// cause chain to stderr, return the exit code for `main` to pass on.
 fn fail(code: i32, e: &anyhow::Error) -> i32 {
     eprintln!("error: {e:#}");
     code
@@ -280,6 +308,7 @@ fn fail(code: i32, e: &anyhow::Error) -> i32 {
 
 // -- tiny stderr logger (keeps the binary free of a logging framework) ------
 
+/// Minimal `log` sink: one `LEVEL message` line per record on stderr.
 struct StderrLogger;
 
 impl log::Log for StderrLogger {
@@ -292,6 +321,8 @@ impl log::Log for StderrLogger {
     fn flush(&self) {}
 }
 
+/// Map `-v` count to a level (0 warn · 1 info · 2+ debug) and install
+/// [`StderrLogger`].
 fn init_logger(verbosity: u8) {
     let level = match verbosity {
         0 => log::LevelFilter::Warn,

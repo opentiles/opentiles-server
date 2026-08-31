@@ -63,6 +63,7 @@ pub fn open(spec: &str) -> Result<Arc<dyn Store>> {
 /// `{root}/texture/5/3/4.png`.
 #[derive(Clone, Debug)]
 pub struct LocalStore {
+    /// Directory every key lives under.
     root: PathBuf,
 }
 
@@ -84,6 +85,7 @@ impl LocalStore {
         p
     }
 
+    /// Depth-first, sorted recursion collecting every file under `dir`.
     fn walk(&self, dir: &Path, out: &mut Vec<String>) -> Result<()> {
         for entry in read_dir_sorted(dir)? {
             if entry.is_dir() {
@@ -95,6 +97,8 @@ impl LocalStore {
         Ok(())
     }
 
+    /// Path → key: the `/`-joined components relative to the root. `None`
+    /// for non-UTF-8 names, which this store never creates itself.
     fn key_of(&self, path: &Path) -> Option<String> {
         let rel = path.strip_prefix(&self.root).ok()?;
         let parts: Option<Vec<&str>> = rel.iter().map(|c| c.to_str()).collect();
@@ -152,6 +156,8 @@ impl Store for LocalStore {
     }
 }
 
+/// Directory entries, sorted so listings are deterministic; a missing
+/// directory is just an empty listing.
 fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>> {
     match std::fs::read_dir(dir) {
         Ok(rd) => {
@@ -164,6 +170,7 @@ fn read_dir_sorted(dir: &Path) -> Result<Vec<PathBuf>> {
     }
 }
 
+/// Shorthand for [`Error::Io`] with the path rendered into the message.
 pub(crate) fn io_err(path: &Path, source: std::io::Error) -> Error {
     Error::Io {
         path: path.display().to_string(),
@@ -198,6 +205,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(feature = "s3")]
 pub use s3::S3Store;
 
+/// The S3 backend (feature `s3`): the AWS SDK wrapped behind the blocking
+/// [`Store`] trait via a store-owned tokio runtime.
 #[cfg(feature = "s3")]
 mod s3 {
     use super::*;
@@ -225,7 +234,9 @@ mod s3 {
     pub struct S3Store {
         /// `Some` until dropped; see the `Drop` impl.
         rt: Option<Runtime>,
+        /// SDK client — cheap to clone, shares one connection pool.
         client: Client,
+        /// Bucket every key maps into.
         bucket: String,
         /// `""` or `"some/prefix/"`.
         prefix: String,
@@ -300,10 +311,12 @@ mod s3 {
             format!("{}{}", self.prefix, key.trim_start_matches('/'))
         }
 
+        /// `s3://bucket/full-key` — how a key appears in errors and logs.
         fn url(&self, key: &str) -> String {
             format!("s3://{}/{}", self.bucket, self.object_key(key))
         }
 
+        /// Run one SDK call to completion from the calling (blocking) thread.
         fn run<T: Send + 'static>(&self, fut: impl Future<Output = T> + Send + 'static) -> T {
             block(
                 self.rt.as_ref().expect("runtime lives until drop").handle(),
@@ -370,6 +383,7 @@ mod s3 {
             .build_https())
     }
 
+    /// An [`Error::Io`] whose "path" is an S3 URL or bucket name.
     fn bad(what: &str, reason: &str) -> Error {
         Error::Io {
             path: what.to_string(),
@@ -406,6 +420,7 @@ mod s3 {
         bad(url, &reason)
     }
 
+    /// Raw HTTP 404 — how a genuinely missing object (or bucket) comes back.
     fn is_404<E>(e: &SdkError<E, HttpResponse>) -> bool {
         e.raw_response().is_some_and(|r| r.status().as_u16() == 404)
     }
@@ -436,6 +451,9 @@ mod s3 {
         denied
     }
 
+    /// Content type recorded on uploads, from the key's extension. Purely
+    /// informational — readers sniff bytes — but it lets the bucket be
+    /// browsed or fronted by a CDN sensibly.
     fn content_type(key: &str) -> &'static str {
         match key.rsplit('.').next() {
             Some("glb") => "model/gltf-binary",

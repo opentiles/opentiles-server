@@ -214,6 +214,9 @@ pub fn build_tile(cfg: &Config, tile: TileId) -> Result<Vec<u8>> {
     Ok(glb)
 }
 
+/// [`Fetcher::fetch_closest`] plus the standard log lines: cache/network
+/// per asset, and a note whenever the asset had to be derived from an
+/// ancestor zoom.
 fn fetch_closest_logged(
     fetcher: &Fetcher,
     provider: &Provider,
@@ -249,6 +252,8 @@ fn fetch_imagery(fetcher: &Fetcher, cfg: &Config, tile: TileId) -> Result<(Vec<u
     Ok((jpeg, c.source))
 }
 
+/// One line per fetched asset — debug for cache hits, info for downloads,
+/// so `-v` shows exactly the network traffic.
 fn log_fetch(what: &str, tile: TileId, origin: Origin, len: usize) {
     match origin {
         Origin::Cache => log::debug!("{what} {tile}: cache hit ({len} bytes)"),
