@@ -201,6 +201,7 @@ async fn server_builds_from_and_publishes_to_s3() {
     .with_uniform_resolution(17);
     cfg.provider.heightmap_url = "http://127.0.0.1:9/h/:zoom:/:x:/:y:.png".into();
     cfg.provider.texture_url = "http://127.0.0.1:9/t/:zoom:/:x:/:y:".into();
+    cfg.provider.normals_url = "http://127.0.0.1:9/n/:zoom:/:x:/:y:.png".into();
     cfg.connect_timeout = Duration::from_millis(200);
     let expected = build_tile(&cfg, centre).unwrap();
 

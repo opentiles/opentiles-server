@@ -37,8 +37,8 @@ curl -I http://127.0.0.1:8080/12/772/1607.glb
 - CORS `*` by default (`--no-cors`). `GET /` returns name, version, fingerprint, URL template,
   resolution table, conventions and attribution; `GET /healthz` → `ok`; `GET /example/` is the
   bundled viewer.
-- Provider flags (`--texture-url`, `--heightmap-url`, `--texture-max-zoom`,
-  `--heightmap-max-zoom`, `--timeout`) work as for `build`.
+- Provider flags (`--texture-url`, `--heightmap-url`, `--normals-url`, the `--*-max-zoom`
+  hints, `--no-normals`, `--timeout`) work as for `build`.
 
 ## Docker
 
@@ -115,15 +115,16 @@ Options for `build`:
 | `-o, --output <path>`                        | `./{zoom}-{x}-{y}.glb`  | where to write                                                                       |
 | `--cache-dir <dir\|s3://…>`                  | `.cache` (`$CACHE_DIR`) | input cache: a directory (layout-compatible with raytiles/bevytiles) or an S3 bucket |
 | `--resolution <n>`                           | per-zoom table (below)  | vertices per edge for this zoom (2..=257)                                            |
-| `--texture-url`, `--heightmap-url`           | Esri / AWS Terrarium    | provider templates with `:zoom:` `:x:` `:y:` tokens                                  |
-| `--texture-max-zoom`, `--heightmap-max-zoom` | `19` / `15`             | deepest zoom to *ask* the provider for; deeper tiles derive from there               |
+| `--texture-url`, `--heightmap-url`, `--normals-url` | Esri / AWS Terrarium / AWS normals | provider templates with `:zoom:` `:x:` `:y:` tokens |
+| `--texture-max-zoom`, `--heightmap-max-zoom`, `--normals-max-zoom` | `19` / `15` / `15` | deepest zoom to *ask* the provider for; deeper tiles derive from there |
+| `--no-normals` | off | skip the normals fetch and the NORMAL attribute |
 | `--timeout <s>`                              | `10`                    | HTTP read timeout                                                                    |
 | `-v` / `-vv`                                 |                         | log fetches, fallbacks and timings                                                   |
 
 Exit codes: `0` ok · `2` usage / invalid tile / bad resolution · `3` nothing upstream at any
 zoom · `4` network, decode or I/O failure.
 
-`open-tiles refresh-404 [--zoom N] [--kind texture|heightmap]` forgets remembered 404s (see
+`open-tiles refresh-404 [--zoom N] [--kind texture|heightmap|normals]` forgets remembered 404s (see
 "Fallback" below).
 
 ## Fallback: any zoom, from whatever the providers have
@@ -135,6 +136,8 @@ starts at `min(zoom, hint)` and, on 404, walks down to the closest lower zoom th
   bilinear interpolation from source texels to vertices, no intermediate image, no cracks at
   ancestor boundaries. Nothing is written to disk.
 - **imagery** — the ancestor's image is cropped to the tile's sub-square and upscaled to 256².
+- **normals** — sampled from the ancestor's normal map through the same window; when *no* zoom
+  has one, normals are synthesized from the height field instead of failing the tile.
 - A provider 404 leaves a zero-byte `{y}.png.404` marker in the cache so the walk never repeats
   a known-missing request; `refresh-404` deletes markers.
 - `extras.terrain_source_zoom` / `extras.imagery_source_zoom` record what was used.
@@ -151,7 +154,7 @@ per zoom. Defaults (vertices per edge), overridable with `--resolution` for a zo
 | zoom          | 1–7    | 8–15   | 16     | 17      | 18    | 19   | 20     | 21    | 22    |
 |---------------|--------|--------|--------|---------|-------|------|--------|-------|-------|
 | vertices/edge | 257    | 129    | 129    | 65      | 33    | 17   | 9      | 5     | 3     |
-| raw mesh      | 2.9 MB | 0.5 MB | 0.5 MB | 0.13 MB | 33 KB | 9 KB | 2.5 KB | <1 KB | <1 KB |
+| raw mesh      | 3.7 MB | 0.7 MB | 0.7 MB | 0.18 MB | 46 KB | 12 KB | 3.4 KB | <1.5 KB | <1 KB |
 
 Whatever zoom the heights really came from, the value is capped at `(256 >> dz) + 1` — beyond
 that a grid only interpolates. `extras.resolution` records the value used
@@ -159,7 +162,9 @@ that a grid only interpolates. `extras.resolution` records the value used
 
 ## What's in a tile
 
-- One mesh, one JPEG texture, one plain PBR material (no normals, no skirts, no extensions).
+- One mesh, one JPEG texture, one plain PBR material, per-vertex normals (no skirts, no
+  extensions). Normals come from the providers' normal tiles (tilezen `normal`) or, where
+  those end, are derived from the heights; `--no-normals` drops them (~35 % smaller tiles).
 - **Frame:** right-handed, Y-up, metres. `+X` east, `+Z` south. Origin at the tile's north-west
   corner; the tile spans `[0, size_m]` in X and Z.
 - **Y is metres above sea level.** Every tile shares the same `Y = 0`, so laying tiles out is an
@@ -194,7 +199,8 @@ cargo test        # fully offline: synthetic Terrarium/imagery fixtures + a loca
 
 ## Data
 
-Imagery © Esri; elevation from the Mapzen Terrain Tiles on AWS Open Data (Terrarium encoding).
+Imagery © Esri; elevation and normal maps from the Mapzen Terrain Tiles on AWS Open Data
+(Terrarium / `normal` encodings).
 Mind their terms of use — the tiles you build embed that data.
 
 ## License

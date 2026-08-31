@@ -19,8 +19,9 @@
 //! - Tile edges are watertight against same-zoom neighbours: boundary
 //!   vertices are sampled over a height field padded with the neighbours'
 //!   edge texels, so both sides evaluate to the same value.
-//! - No normals, no skirts. Viewers compute flat normals; LOD seams are the
-//!   client's problem.
+//! - Per-vertex normals, from the providers' normal tiles or synthesized
+//!   from the heights ([`normals`]); no skirts — LOD seams are the client's
+//!   problem.
 //! - Any zoom 1–22. When a provider has nothing at the requested zoom, the
 //!   asset comes from the closest lower zoom that exists: heights by sampling
 //!   a window of the ancestor's field, imagery by crop-and-upscale.
@@ -43,6 +44,7 @@ pub mod fetch;
 pub mod glb;
 pub mod imagery;
 pub mod mesh;
+pub mod normals;
 pub mod provider;
 pub mod server;
 pub mod store;

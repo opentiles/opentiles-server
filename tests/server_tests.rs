@@ -20,6 +20,7 @@ fn cfg_for(cache: &std::path::Path, srv: &Server) -> Config {
     let mut cfg = Config::with_cache_dir(cache).with_uniform_resolution(17);
     cfg.provider.heightmap_url = format!("{}/h/:zoom:/:x:/:y:.png", srv.base);
     cfg.provider.texture_url = format!("{}/t/:zoom:/:x:/:y:", srv.base);
+    cfg.provider.normals_url = format!("{}/n/:zoom:/:x:/:y:.png", srv.base);
     cfg.connect_timeout = std::time::Duration::from_millis(500);
     cfg
 }
@@ -154,6 +155,7 @@ async fn error_mapping() {
     let mut cfg = cfg_for(dir2.path(), &srv);
     cfg.provider.heightmap_url = "http://127.0.0.1:9/h/:zoom:/:x:/:y:.png".into();
     cfg.provider.texture_url = "http://127.0.0.1:9/t/:zoom:/:x:/:y:".into();
+    cfg.provider.normals_url = "http://127.0.0.1:9/n/:zoom:/:x:/:y:.png".into();
     let (base, _) = serve(cfg, ServeConfig::default()).await;
     let (status, h, _) = get(format!("{base}/5/1/1.glb"), None).await;
     assert_eq!(status, 502);

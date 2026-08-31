@@ -60,11 +60,17 @@ pub fn fingerprint(cfg: &Config) -> String {
         h.update(&r.to_le_bytes());
     }
     let p = &cfg.provider;
-    for s in [&p.texture_url, &p.heightmap_url] {
+    for s in [&p.texture_url, &p.heightmap_url, &p.normals_url] {
         h.update(s.as_bytes());
         h.update(b"\0");
     }
-    h.update(&[p.texture_max_zoom, p.heightmap_max_zoom, cfg.jpeg_quality]);
+    h.update(&[
+        p.texture_max_zoom,
+        p.heightmap_max_zoom,
+        p.normals_max_zoom,
+        cfg.jpeg_quality,
+        cfg.include_normals as u8,
+    ]);
     h.finalize().to_hex()[..16].to_string()
 }
 

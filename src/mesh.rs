@@ -51,6 +51,9 @@ pub struct Grid {
     pub positions: Vec<[f32; 3]>,
     /// `[u, v]` in `[0, 1]`.
     pub uvs: Vec<[f32; 2]>,
+    /// Unit normals in the tile frame, one per vertex — empty when normals
+    /// are disabled (the GLB then carries no NORMAL attribute).
+    pub normals: Vec<[f32; 3]>,
     /// Triangle list, CCW from above.
     pub indices: Vec<u32>,
     /// Per-axis minimum of `positions` (glTF requires it on POSITION).
@@ -80,13 +83,22 @@ pub fn check_resolution(resolution: u32) -> Result<()> {
     }
 }
 
-/// Build the grid for a tile of `size_m` metres per edge.
-pub fn build_grid(field: &HeightField, size_m: f64, resolution: u32) -> Result<Grid> {
+/// Build the grid for a tile of `size_m` metres per edge. `normal_at`
+/// supplies the per-vertex normal for the same `(u, v)` the height is
+/// sampled at (a provider map or the height-derived synth — see
+/// [`normals`](crate::normals)); `None` builds a grid without normals.
+pub fn build_grid(
+    field: &HeightField,
+    size_m: f64,
+    resolution: u32,
+    normal_at: Option<&dyn Fn(f64, f64) -> [f32; 3]>,
+) -> Result<Grid> {
     check_resolution(resolution)?;
     let r = resolution as usize;
     let n = (r - 1) as f64; // quads per edge
     let mut positions = Vec::with_capacity(r * r);
     let mut uvs = Vec::with_capacity(r * r);
+    let mut normals = Vec::with_capacity(if normal_at.is_some() { r * r } else { 0 });
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
 
@@ -104,6 +116,9 @@ pub fn build_grid(field: &HeightField, size_m: f64, resolution: u32) -> Result<G
             }
             positions.push(p);
             uvs.push([u as f32, v as f32]);
+            if let Some(f) = normal_at {
+                normals.push(f(u, v));
+            }
         }
     }
 
@@ -125,6 +140,7 @@ pub fn build_grid(field: &HeightField, size_m: f64, resolution: u32) -> Result<G
         resolution,
         positions,
         uvs,
+        normals,
         indices,
         min,
         max,
@@ -142,7 +158,7 @@ mod tests {
 
     #[test]
     fn counts_corners_and_bounds() {
-        let g = build_grid(&flat(100.0), 1000.0, 5).unwrap();
+        let g = build_grid(&flat(100.0), 1000.0, 5, None).unwrap();
         assert_eq!(g.positions.len(), 25);
         assert_eq!(g.triangles(), 32);
         assert_eq!(g.positions[0], [0.0, 100.0, 0.0]);
@@ -151,7 +167,7 @@ mod tests {
         assert_eq!(g.min, [0.0, 100.0, 0.0]);
         assert_eq!(g.max, [1000.0, 100.0, 1000.0]);
         assert!(g.fits_u16());
-        assert!(!build_grid(&flat(0.0), 1.0, 257).unwrap().fits_u16());
+        assert!(!build_grid(&flat(0.0), 1.0, 257, None).unwrap().fits_u16());
     }
 
     #[test]
@@ -171,8 +187,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_resolution() {
-        assert!(build_grid(&flat(0.0), 1.0, 1).is_err());
-        assert!(build_grid(&flat(0.0), 1.0, 258).is_err());
+        assert!(build_grid(&flat(0.0), 1.0, 1, None).is_err());
+        assert!(build_grid(&flat(0.0), 1.0, 258, None).is_err());
     }
 
     #[test]
@@ -182,7 +198,7 @@ mod tests {
         let tile: Vec<f32> = (0..n * n)
             .map(|i| ((i % n) as f32 * 0.3).sin() * 50.0 + ((i / n) as f32 * 0.2).cos() * 30.0)
             .collect();
-        let g = build_grid(&HeightField::unpadded(&tile), 500.0, 33).unwrap();
+        let g = build_grid(&HeightField::unpadded(&tile), 500.0, 33, None).unwrap();
         for t in g.indices.chunks(3) {
             let p = |k: u32| g.positions[k as usize];
             let (a, b, c) = (p(t[0]), p(t[1]), p(t[2]));
@@ -207,8 +223,8 @@ mod tests {
         let mut ne: [Option<Vec<f32>>; 8] = Default::default();
         ne[Side::W as usize] = Some(west.clone());
         let r = 65u32;
-        let gw = build_grid(&HeightField::padded(&west, &nw), 1000.0, r).unwrap();
-        let ge = build_grid(&HeightField::padded(&east, &ne), 1000.0, r).unwrap();
+        let gw = build_grid(&HeightField::padded(&west, &nw), 1000.0, r, None).unwrap();
+        let ge = build_grid(&HeightField::padded(&east, &ne), 1000.0, r, None).unwrap();
         for j in 0..r as usize {
             let a = gw.positions[j * r as usize + (r as usize - 1)];
             let b = ge.positions[j * r as usize];
