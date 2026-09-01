@@ -15,9 +15,11 @@
 //! Failures are published too, so waiters fail fast instead of each retrying
 //! upstream. Requests arriving after publication hit the cache.
 //!
+//! `GET /{z}/{x}/{y}.json` serves the tile's metadata document
+//! ([`crate::metadata`]), computed on demand and cached next to the tile.
 //! `GET /metadata` scans the whole output cache and writes every missing
-//! per-tile metadata document ([`crate::metadata`]), streaming progress as
-//! server-sent events; closing the connection stops the scan.
+//! document, streaming progress as server-sent events; closing the
+//! connection stops the scan.
 
 use crate::builder::{build_tile, Config};
 use crate::metadata::Outcome as MetadataOutcome;
@@ -130,6 +132,33 @@ impl AppState {
     /// The output-cache fingerprint in use.
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// The tile's metadata document: output cache, or computed on demand
+    /// and published there. Concurrent computes of one tile are harmless
+    /// (identical bytes, atomic put), so unlike builds they are not deduped.
+    pub async fn metadata_doc(self: &Arc<Self>, tile: TileId) -> Outcome {
+        let key = metadata_key(&self.fingerprint, tile);
+        let cfg = self.cfg.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            match cfg.cache.get(&key) {
+                Ok(Some(bytes)) if !bytes.is_empty() => return Ok(bytes),
+                Ok(_) => {}
+                Err(e) => log::warn!("{tile}: metadata cache read failed, recomputing: {e}"),
+            }
+            let bytes = crate::metadata::compute(&cfg, tile)?.to_json_bytes();
+            cfg.cache.put(&key, &bytes)?;
+            Ok::<_, Error>(bytes)
+        })
+        .await;
+        match res {
+            Ok(Ok(bytes)) => Ok(bytes.into()),
+            Ok(Err(e)) => Err(Arc::new(e)),
+            Err(join) => Err(Arc::new(Error::Fetch {
+                url: tile.to_string(),
+                reason: format!("metadata task panicked: {join}"),
+            })),
+        }
     }
 
     /// The tile bytes: output cache, or a (deduplicated) build.
@@ -271,6 +300,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
         "version": env!("CARGO_PKG_VERSION"),
         "fingerprint": state.fingerprint,
         "tiles": "/{z}/{x}/{y}.glb",
+        "tile_metadata": "/{z}/{x}/{y}.json",
         "example": "/example/",
         "metadata": "/metadata",
         "zoom": { "min": crate::tile::MIN_ZOOM, "max": crate::tile::MAX_ZOOM },
@@ -393,9 +423,10 @@ async fn metadata_scan(State(state): State<Arc<AppState>>) -> Response {
     )
 }
 
-/// `GET`/`HEAD` `/{z}/{x}/{y}.glb` — parse the address, get the bytes from
-/// [`AppState::tile`] (cache hit or deduplicated build), then handle the
-/// HTTP niceties: ETag / `If-None-Match` → 304, bodyless HEAD, immutable
+/// `GET`/`HEAD` `/{z}/{x}/{y}.glb` (the tile) and `/{z}/{x}/{y}.json` (its
+/// metadata document) — parse the address, get the bytes from
+/// [`AppState::tile`] / [`AppState::metadata_doc`], then handle the HTTP
+/// niceties: ETag / `If-None-Match` → 304, bodyless HEAD, immutable
 /// cache-control, and the error → status mapping.
 async fn tile(
     State(state): State<Arc<AppState>>,
@@ -404,7 +435,7 @@ async fn tile(
     headers: HeaderMap,
 ) -> Response {
     let cors = state.serve.cors;
-    let tile = match parse_tile_path(&z, &x, &y) {
+    let (tile, asset) = match parse_tile_path(&z, &x, &y) {
         Ok(t) => t,
         Err(msg) => {
             return finish(
@@ -413,7 +444,11 @@ async fn tile(
             )
         }
     };
-    match state.tile(tile).await {
+    let outcome = match asset {
+        Asset::Glb => state.tile(tile).await,
+        Asset::Metadata => state.metadata_doc(tile).await,
+    };
+    match outcome {
         Ok(bytes) => {
             let etag = format!("\"{}-{}\"", state.fingerprint, bytes.len());
             let matches = headers
@@ -430,7 +465,10 @@ async fn tile(
             let h = resp.headers_mut();
             h.insert(
                 header::CONTENT_TYPE,
-                HeaderValue::from_static("model/gltf-binary"),
+                HeaderValue::from_static(match asset {
+                    Asset::Glb => "model/gltf-binary",
+                    Asset::Metadata => "application/json",
+                }),
             );
             h.insert(
                 header::CACHE_CONTROL,
@@ -461,11 +499,25 @@ async fn tile(
     }
 }
 
-/// `("12", "772", "1607.glb")` → the tile; anything else is a 400 message.
-fn parse_tile_path(z: &str, x: &str, y: &str) -> Result<TileId, String> {
-    let y = y
-        .strip_suffix(".glb")
-        .ok_or_else(|| "expected /{z}/{x}/{y}.glb".to_string())?;
+/// Which per-tile resource a request names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asset {
+    /// `{y}.glb` — the tile itself.
+    Glb,
+    /// `{y}.json` — the tile's metadata document.
+    Metadata,
+}
+
+/// `("12", "772", "1607.glb")` → the tile and which asset of it
+/// (`.glb` or `.json`); anything else is a 400 message.
+fn parse_tile_path(z: &str, x: &str, y: &str) -> Result<(TileId, Asset), String> {
+    let (y, asset) = if let Some(y) = y.strip_suffix(".glb") {
+        (y, Asset::Glb)
+    } else if let Some(y) = y.strip_suffix(".json") {
+        (y, Asset::Metadata)
+    } else {
+        return Err("expected /{z}/{x}/{y}.glb or /{z}/{x}/{y}.json".to_string());
+    };
     let num = |s: &str, what: &str| {
         s.parse::<u32>()
             .map_err(|_| format!("{what} must be a non-negative integer, got {s:?}"))
@@ -473,7 +525,8 @@ fn parse_tile_path(z: &str, x: &str, y: &str) -> Result<TileId, String> {
     let z = num(z, "zoom")?;
     let (x, y) = (num(x, "x")?, num(y, "y")?);
     let z = u8::try_from(z).map_err(|_| format!("zoom {z} out of range"))?;
-    TileId::new(z, x, y).map_err(|e| e.to_string())
+    let tile = TileId::new(z, x, y).map_err(|e| e.to_string())?;
+    Ok((tile, asset))
 }
 
 /// A JSON error body `{"error", "status"}` with the given cache policy.
@@ -509,12 +562,17 @@ mod tests {
     fn parses_tile_paths() {
         assert_eq!(
             parse_tile_path("12", "772", "1607.glb").unwrap(),
-            TileId::new(12, 772, 1607).unwrap()
+            (TileId::new(12, 772, 1607).unwrap(), Asset::Glb)
+        );
+        assert_eq!(
+            parse_tile_path("12", "772", "1607.json").unwrap(),
+            (TileId::new(12, 772, 1607).unwrap(), Asset::Metadata)
         );
         assert!(parse_tile_path("12", "772", "1607").is_err());
         assert!(parse_tile_path("12", "772", "1607.gltf").is_err());
         assert!(parse_tile_path("-1", "0", "0.glb").is_err());
         assert!(parse_tile_path("300", "0", "0.glb").is_err());
         assert!(parse_tile_path("3", "9", "0.glb").is_err());
+        assert!(parse_tile_path("3", "9", "0.json").is_err());
     }
 }

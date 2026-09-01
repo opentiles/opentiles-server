@@ -32,6 +32,7 @@ open-tiles serve --bind 0.0.0.0:8080 --cache-dir .cache -v
 | endpoint             | description                                                              |
 |----------------------|--------------------------------------------------------------------------|
 | `GET /{z}/{x}/{y}.glb` | the tile — built on first request, then served from the cache          |
+| `GET /{z}/{x}/{y}.json` | the tile's metadata document — computed on demand, then cached        |
 | `GET /metadata`      | generate missing tile metadata, streaming progress as SSE (see below)    |
 | `GET /`              | service description: version, fingerprint, URL template, conventions     |
 | `GET /healthz`       | liveness — answers `ok`                                                  |

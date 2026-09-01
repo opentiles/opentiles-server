@@ -333,3 +333,41 @@ async fn metadata_endpoint_streams_progress_and_rejects_a_second_scan() {
     let events = sse_events(&body);
     assert_eq!(events.last().unwrap()["skipped"], 2, "{events:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serves_tile_metadata_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let centre = TileId::new(10, 500, 400).unwrap();
+    seed_block(dir.path(), centre);
+    let srv = Server::start(vec![]);
+    let cfg = cfg_for(dir.path(), &srv);
+    let (base, state) = serve(cfg, ServeConfig::default()).await;
+
+    // computed on demand, cached, correct type and body
+    let (status, h, body) = get(format!("{base}/10/500/400.json"), None).await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(header(&h, "content-type"), Some("application/json"));
+    assert_eq!(
+        header(&h, "cache-control"),
+        Some("public, max-age=31536000, immutable")
+    );
+    let etag = header(&h, "etag").unwrap().to_string();
+    let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(meta["zoom"], 10);
+    assert_eq!(meta["x"], 500);
+    assert_eq!(meta["y"], 400);
+    assert!(meta["tile_size_m"].as_f64().unwrap() > 0.0);
+    let cached = dir.path().join(open_tiles::server::metadata_key(
+        state.fingerprint(),
+        centre,
+    ));
+    assert_eq!(std::fs::read(&cached).unwrap(), body);
+
+    // 304 on a matching ETag; 400 on a bad path; 404 when nothing upstream
+    let (status, _, _) = get(format!("{base}/10/500/400.json"), Some(etag)).await;
+    assert_eq!(status, 304);
+    let (status, _, _) = get(format!("{base}/10/500/400.xml"), None).await;
+    assert_eq!(status, 400);
+    let (status, _, _) = get(format!("{base}/10/1/1.json"), None).await;
+    assert_eq!(status, 404);
+}
