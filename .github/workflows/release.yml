@@ -1,0 +1,41 @@
+# Manually triggered release: reads the version from Cargo.toml and creates
+# the matching tag and GitHub release (version 2.6.8 → tag v2.6.8), with
+# auto-generated notes. Fails if the tag already exists.
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ -z "$version" ]; then
+            echo "::error::no version found in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if the tag already exists
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG already exists — bump the version in Cargo.toml first"
+            exit 1
+          fi
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+
+      - name: Create tag and release
+        run: gh release create "$TAG" --title "$TAG" --generate-notes --target "$GITHUB_SHA"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
