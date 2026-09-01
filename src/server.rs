@@ -14,19 +14,26 @@
 //! channel; concurrent requests for the same tile wait on that channel.
 //! Failures are published too, so waiters fail fast instead of each retrying
 //! upstream. Requests arriving after publication hit the cache.
+//!
+//! `GET /metadata` scans the whole output cache and writes every missing
+//! per-tile metadata document ([`crate::metadata`]), streaming progress as
+//! server-sent events; closing the connection stops the scan.
 
 use crate::builder::{build_tile, Config};
+use crate::metadata::Outcome as MetadataOutcome;
 use crate::tile::TileId;
 use crate::Error;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
@@ -79,6 +86,12 @@ pub fn output_key(fingerprint: &str, tile: TileId) -> String {
     format!("glb/{fingerprint}/{}/{}/{}.glb", tile.zoom, tile.x, tile.y)
 }
 
+/// Output-cache key of a tile's metadata document under `fingerprint` —
+/// the tile's key with a `.json` extension (see [`crate::metadata`]).
+pub fn metadata_key(fingerprint: &str, tile: TileId) -> String {
+    format!("glb/{fingerprint}/{}/{}/{}.json", tile.zoom, tile.x, tile.y)
+}
+
 /// What one build produced — the GLB bytes or the error to report — shared
 /// between the build's leader and every waiter (hence the `Arc`s).
 type Outcome = Result<Arc<[u8]>, Arc<Error>>;
@@ -96,6 +109,8 @@ pub struct AppState {
     inflight: Mutex<HashMap<TileId, watch::Receiver<Option<Outcome>>>>,
     /// Bounds how many *different* tiles build at once (`max_builds`).
     builds: Semaphore,
+    /// Whether a `GET /metadata` scan is running (they don't overlap).
+    metadata_running: AtomicBool,
 }
 
 impl AppState {
@@ -108,6 +123,7 @@ impl AppState {
             serve,
             fingerprint,
             inflight: Mutex::new(HashMap::new()),
+            metadata_running: AtomicBool::new(false),
         })
     }
 
@@ -169,16 +185,24 @@ impl AppState {
     }
 
     /// Build `tile` as the sole leader and publish the bytes at `key` in
-    /// the output cache. Takes a build permit first (the global concurrency
-    /// bound) and runs the synchronous builder under `spawn_blocking` so
-    /// the async workers stay free.
+    /// the output cache, followed by the tile's metadata document (which
+    /// rides along with every build; a metadata failure is only logged —
+    /// `open-tiles metadata` fills the gaps). Takes a build permit first
+    /// (the global concurrency bound) and runs the synchronous builder
+    /// under `spawn_blocking` so the async workers stay free.
     async fn lead_build(&self, tile: TileId, key: String) -> Outcome {
         let _permit = self.builds.acquire().await.expect("semaphore closed");
         let cfg = self.cfg.clone();
+        let json_key = metadata_key(&self.fingerprint, tile);
         let started = std::time::Instant::now();
         let res = tokio::task::spawn_blocking(move || {
             let glb = build_tile(&cfg, tile)?;
             cfg.cache.put(&key, &glb)?;
+            match crate::metadata::write_missing(&cfg, tile, &json_key) {
+                Ok(true) => log::debug!("{tile}: wrote metadata {json_key}"),
+                Ok(false) => {}
+                Err(e) => log::warn!("{tile}: metadata failed ({e}); run `open-tiles metadata`"),
+            }
             Ok::<_, Error>(glb)
         })
         .await;
@@ -210,6 +234,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/example", get(example))
         .route("/example/", get(example))
+        .route("/metadata", get(metadata_scan))
         // the router can't split `{y}.glb` inside one segment; the handler does
         .route("/{z}/{x}/{y}", get(tile))
         .with_state(state)
@@ -247,6 +272,7 @@ async fn index(State(state): State<Arc<AppState>>) -> Response {
         "fingerprint": state.fingerprint,
         "tiles": "/{z}/{x}/{y}.glb",
         "example": "/example/",
+        "metadata": "/metadata",
         "zoom": { "min": crate::tile::MIN_ZOOM, "max": crate::tile::MAX_ZOOM },
         "resolution": cfg.resolution,
         "conventions": {
@@ -285,6 +311,84 @@ async fn example(State(state): State<Arc<AppState>>) -> Response {
             ],
             include_str!("../example/index.html"),
         )
+            .into_response(),
+    )
+}
+
+/// `GET /metadata` — write the missing metadata document of every built
+/// tile in the cache (see [`crate::metadata`]), streaming progress as
+/// server-sent events: one JSON event per tile
+/// (`{"tile", "key", "status": written|skipped|failed}`) and a final
+/// summary (`{"done": true, …}`). Closing the connection stops the scan
+/// after the tile in flight; only one scan runs at a time (409 otherwise).
+async fn metadata_scan(State(state): State<Arc<AppState>>) -> Response {
+    let cors = state.serve.cors;
+    if state.metadata_running.swap(true, Ordering::SeqCst) {
+        return finish(
+            cors,
+            error_response(
+                StatusCode::CONFLICT,
+                "a metadata scan is already running",
+                "no-store",
+            ),
+        );
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<Event>(64);
+    let worker = state.clone();
+    tokio::task::spawn_blocking(move || {
+        /// Clears the running flag however the scan ends (panic included).
+        struct Running(Arc<AppState>);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.0.metadata_running.store(false, Ordering::SeqCst);
+            }
+        }
+        let _running = Running(worker.clone());
+        log::info!("metadata scan started");
+        let event =
+            |value: serde_json::Value| Event::default().json_data(value).expect("value serializes");
+        let res = crate::metadata::generate_missing_with(&worker.cfg, |key, tile, outcome| {
+            let sent = tx
+                .blocking_send(event(json!({
+                    "tile": tile.to_string(),
+                    "key": key,
+                    "status": match outcome {
+                        MetadataOutcome::Written => "written",
+                        MetadataOutcome::Skipped => "skipped",
+                        MetadataOutcome::Failed => "failed",
+                    },
+                })))
+                .is_ok();
+            if !sent {
+                log::info!("metadata scan stopped: client disconnected");
+            }
+            sent
+        });
+        let summary = match res {
+            Ok(s) => {
+                log::info!(
+                    "metadata scan done: {} written, {} skipped, {} failed",
+                    s.written,
+                    s.skipped,
+                    s.failed
+                );
+                json!({ "done": true, "written": s.written, "skipped": s.skipped, "failed": s.failed })
+            }
+            Err(e) => {
+                log::warn!("metadata scan failed: {e}");
+                json!({ "done": true, "error": e.to_string() })
+            }
+        };
+        let _ = tx.blocking_send(event(summary));
+    });
+    let stream = tokio_stream::StreamExt::map(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+        Ok::<_, std::convert::Infallible>,
+    );
+    finish(
+        cors,
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
             .into_response(),
     )
 }

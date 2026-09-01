@@ -11,10 +11,10 @@
 name: Docker image
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
+#  push:
+#    branches: [main]
+#    tags: ['v*']
+#  pull_request:
   workflow_dispatch:
 
 env:

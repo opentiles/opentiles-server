@@ -209,3 +209,127 @@ fn fingerprint_tracks_the_config() {
     };
     assert_eq!(fa, fingerprint(&d));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn build_writes_metadata_alongside_the_tile() {
+    let dir = tempfile::tempdir().unwrap();
+    let centre = TileId::new(10, 500, 400).unwrap();
+    seed_block(dir.path(), centre);
+    // the mock provider has no children at z11: geometric error must be 0
+    let srv = Server::start(vec![]);
+    let cfg = cfg_for(dir.path(), &srv);
+    let (base, state) = serve(cfg, ServeConfig::default()).await;
+
+    // a pre-existing document for another tile must survive its build
+    let other = TileId::new(10, 499, 400).unwrap();
+    let other_json = dir
+        .path()
+        .join(open_tiles::server::metadata_key(state.fingerprint(), other));
+    std::fs::create_dir_all(other_json.parent().unwrap()).unwrap();
+    std::fs::write(&other_json, b"{\"sentinel\":true}").unwrap();
+
+    let (status, _, _) = get(format!("{base}/10/500/400.glb"), None).await;
+    assert_eq!(status, 200);
+    let (status, _, _) = get(format!("{base}/10/499/400.glb"), None).await;
+    assert_eq!(status, 200);
+
+    let json_path = dir.path().join(open_tiles::server::metadata_key(
+        state.fingerprint(),
+        centre,
+    ));
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+    assert_eq!(meta["zoom"], 10);
+    assert_eq!(meta["x"], 500);
+    assert_eq!(meta["y"], 400);
+    assert!((meta["tile_size_m"].as_f64().unwrap() - centre.size_m()).abs() < 1e-6);
+    assert!(meta["max_height_m"].as_f64().unwrap() >= meta["min_height_m"].as_f64().unwrap());
+    assert_eq!(meta["geometric_error_m"], 0.0, "{meta}");
+
+    assert_eq!(
+        std::fs::read(&other_json).unwrap(),
+        b"{\"sentinel\":true}",
+        "an existing document must not be recomputed"
+    );
+}
+
+/// The JSON of every `data:` line in an SSE body (keep-alive comments and
+/// blank lines are skipped).
+fn sse_events(body: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(body)
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_endpoint_streams_progress_and_rejects_a_second_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let centre = TileId::new(10, 500, 400).unwrap();
+    seed_block(dir.path(), centre);
+    // the children exist upstream but answer slowly, keeping the scan busy
+    // long enough for the concurrent request to hit the guard
+    let child_png = terrarium_png(|_, _| 100.0);
+    let routes: Vec<(String, Vec<u8>)> = [(0u32, 0u32), (1, 0), (0, 1), (1, 1)]
+        .iter()
+        .map(|&(dx, dy)| {
+            (
+                format!("/h/11/{}/{}.png", 1000 + dx, 800 + dy),
+                child_png.clone(),
+            )
+        })
+        .collect();
+    let srv = Server::start_with_delay(routes, std::time::Duration::from_millis(200));
+    let cfg = cfg_for(dir.path(), &srv);
+    let (base, _state) = serve(cfg, ServeConfig::default()).await;
+
+    // two fingerprints hold the tile; only one already has its document
+    for fp in ["aaa", "bbb"] {
+        let p = dir.path().join(format!("glb/{fp}/10/500/400.glb"));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"glTF fake").unwrap();
+    }
+    std::fs::write(dir.path().join("glb/bbb/10/500/400.json"), b"{}").unwrap();
+
+    let first = tokio::spawn(get(format!("{base}/metadata"), None));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (status, _, body) = get(format!("{base}/metadata"), None).await;
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+
+    let (status, h, body) = first.await.unwrap();
+    assert_eq!(status, 200);
+    assert!(
+        header(&h, "content-type")
+            .unwrap()
+            .starts_with("text/event-stream"),
+        "{h:?}"
+    );
+    let events = sse_events(&body);
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events[0]["status"], "written");
+    assert_eq!(events[0]["tile"], "10/500/400");
+    assert_eq!(events[0]["key"], "glb/aaa/10/500/400.json");
+    assert_eq!(events[1]["status"], "skipped");
+    assert_eq!(events[1]["key"], "glb/bbb/10/500/400.json");
+    assert_eq!(events[2]["done"], true);
+    assert_eq!(events[2]["written"], 1);
+    assert_eq!(events[2]["skipped"], 1);
+    assert_eq!(events[2]["failed"], 0);
+
+    // the document landed, with the children's detail measured
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("glb/aaa/10/500/400.json")).unwrap())
+            .unwrap();
+    assert!(meta["geometric_error_m"].as_f64().unwrap() > 0.0, "{meta}");
+    assert_eq!(
+        std::fs::read(dir.path().join("glb/bbb/10/500/400.json")).unwrap(),
+        b"{}"
+    );
+
+    // the guard released: a re-run answers 200 and skips everything
+    let (status, _, body) = get(format!("{base}/metadata"), None).await;
+    assert_eq!(status, 200);
+    let events = sse_events(&body);
+    assert_eq!(events.last().unwrap()["skipped"], 2, "{events:?}");
+}

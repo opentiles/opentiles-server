@@ -1,5 +1,6 @@
 //! `open-tiles` CLI: build one terrain tile as a GLB, serve tiles over HTTP,
-//! look up which tile covers a coordinate, or clear negative-cache markers.
+//! look up which tile covers a coordinate, generate missing per-tile
+//! metadata, or clear negative-cache markers.
 //!
 //! Exit codes: 0 ok · 2 usage / invalid tile · 3 nothing upstream at any
 //! zoom · 4 network, decode or I/O failure.
@@ -31,7 +32,7 @@ struct Cli {
     cmd: Cmd,
 }
 
-/// The four operations; each maps onto one `run_*` function below.
+/// The five operations; each maps onto one `run_*` function below.
 #[derive(Subcommand)]
 enum Cmd {
     /// Build one tile and write it as a .glb file.
@@ -40,6 +41,8 @@ enum Cmd {
     Lookup(LookupArgs),
     /// Serve tiles over HTTP: GET /{z}/{x}/{y}.glb, built on demand and cached.
     Serve(ServeArgs),
+    /// Write the missing metadata JSONs next to the built tiles in the cache.
+    Metadata(MetadataArgs),
     /// Forget cached 404s so the providers are asked again.
     #[command(name = "refresh-404")]
     Refresh404(RefreshArgs),
@@ -162,6 +165,18 @@ struct LookupArgs {
     zoom: u8,
 }
 
+/// Arguments of `open-tiles metadata`.
+#[derive(Args)]
+struct MetadataArgs {
+    /// Cache holding the built tiles (glb/{fingerprint}/z/x/y.glb) and the
+    /// heightmaps: a directory or s3://bucket[/prefix].
+    #[arg(long, default_value = ".cache", env = "CACHE_DIR")]
+    cache_dir: String,
+    /// Shared provider flags (heightmaps missing from the cache are fetched).
+    #[command(flatten)]
+    provider: ProviderArgs,
+}
+
 /// `--kind` values for `refresh-404`, mirroring [`Kind`].
 #[derive(Clone, Copy, ValueEnum)]
 enum AssetKind {
@@ -194,14 +209,16 @@ fn main() {
         Cmd::Build(a) => run_build(a),
         Cmd::Lookup(a) => run_lookup(a),
         Cmd::Serve(a) => run_serve(a),
+        Cmd::Metadata(a) => run_metadata(a),
         Cmd::Refresh404(a) => run_refresh(a),
     };
     std::process::exit(code);
 }
 
 /// `build`: build one tile, write the GLB to `--output` (default
-/// `./{zoom}-{x}-{y}.glb`), and map error kinds onto the documented exit
-/// codes (2 usage · 3 not found · 4 network/decode/IO).
+/// `./{zoom}-{x}-{y}.glb`) with its metadata JSON next to it, and map
+/// error kinds onto the documented exit codes (2 usage · 3 not found ·
+/// 4 network/decode/IO).
 fn run_build(a: BuildArgs) -> i32 {
     let tile = match TileId::new(a.zoom, a.x, a.y) {
         Ok(t) => t,
@@ -237,6 +254,20 @@ fn run_build(a: BuildArgs) -> i32 {
         return fail(4, &e);
     }
     println!("{} ({} bytes)", output.display(), glb.len());
+    // the metadata document rides along with every build; a failure leaves
+    // only the .glb (the build itself succeeded)
+    let json = output.with_extension("json");
+    match open_tiles::metadata::compute(&cfg, tile) {
+        Ok(meta) => {
+            if let Err(e) = open_tiles::fetch::write_atomic(&json, &meta.to_json_bytes())
+                .with_context(|| format!("writing {}", json.display()))
+            {
+                return fail(4, &e);
+            }
+            println!("{}", json.display());
+        }
+        Err(e) => log::warn!("{tile}: metadata failed: {e}"),
+    }
     0
 }
 
@@ -288,6 +319,35 @@ fn run_serve(a: ServeArgs) -> i32 {
     match rt.block_on(open_tiles::server::run(cfg, serve)) {
         Ok(()) => 0,
         Err(e) => fail(4, &anyhow::Error::from(e).context("serving")),
+    }
+}
+
+/// `metadata`: write the missing per-tile metadata JSONs next to every
+/// built tile in the cache (exit 4 when any tile failed — the rest are
+/// still written).
+fn run_metadata(a: MetadataArgs) -> i32 {
+    let cache = match open_cache(&a.cache_dir) {
+        Ok(c) => c,
+        Err(e) => return fail(4, &e),
+    };
+    let mut cfg = Config {
+        cache,
+        ..Config::default()
+    };
+    a.provider.apply(&mut cfg);
+    match open_tiles::metadata::generate_missing(&cfg) {
+        Ok(s) => {
+            println!(
+                "metadata: {} written, {} skipped, {} failed",
+                s.written, s.skipped, s.failed
+            );
+            if s.failed > 0 {
+                4
+            } else {
+                0
+            }
+        }
+        Err(e) => fail(4, &e.into()),
     }
 }
 

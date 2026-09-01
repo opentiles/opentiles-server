@@ -5,7 +5,8 @@
 //! addressed by slippy-map `zoom/x/y`.
 //!
 //! The library is the builder plus the HTTP server ([`server`]); the
-//! `open-tiles` binary wraps both (`build`, `serve`, `lookup`, `refresh-404`).
+//! `open-tiles` binary wraps both (`build`, `serve`, `lookup`, `metadata`,
+//! `refresh-404`).
 //!
 //! ## Conventions
 //!
@@ -44,6 +45,7 @@ pub mod fetch;
 pub mod glb;
 pub mod imagery;
 pub mod mesh;
+pub mod metadata;
 pub mod normals;
 pub mod provider;
 pub mod server;
