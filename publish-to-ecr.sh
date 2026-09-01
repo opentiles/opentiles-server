@@ -1,7 +1,7 @@
 #!/bin/sh
 
 ECR_REGISTRY=667512625118.dkr.ecr.eu-north-1.amazonaws.com
-IMAGE_TAG=v0.2.5
+IMAGE_TAG=v$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)
 
 aws login --profile opentiles-deploy
 
