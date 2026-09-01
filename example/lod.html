@@ -1,0 +1,461 @@
+<!doctype html>
+<!--
+  Quadtree LOD demo viewer for open-tiles (see lod-plan.md).
+
+  Like index.html but the view is filled with tiles of *mixed* zooms: a
+  quadtree rooted at `base zoom` covers the camera frustum, and a tile is
+  split into its 4 children (spec §2.3) while its screen-space error
+      sse = (tileSize / 256) · errorScale · screenHeightPx / (2 · d · tan(fovY/2))
+  exceeds the `maxError` pixel budget (3D-Tiles style; d = distance from the
+  camera to the tile's bounding box). With ε = tileSize/256 the sse is the
+  on-screen size of one source texel, so maxError ≈ 2 px keeps imagery crisp. Placement generalizes spec §3.4
+  "uniform grid" across zooms: a zoom-z tile gets grid edge G / 2^(z-base)
+  and is scaled in X/Z only, so a child occupies exactly one quadrant of its
+  parent. A parent stays visible until all 4 children are ready, so
+  refinement never opens holes. The spec only guarantees crack-free edges
+  between same-zoom tiles (§5.4), so hairline cracks at LOD boundaries are
+  expected — turn on wireframe (tinted per zoom) to see the LOD rings.
+  Parameters live in the URL query so views are shareable.
+
+  Navigation is flight-style, keyboard only (no mouse orbit): arrows tilt and
+  yaw, Q/E roll, W/S throttle the forward velocity up/down (S to zero stops).
+  The debug checkbox draws each shown tile's bounding box with a z/x/y label.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-tiles LOD example</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1d2733; color: #e8eef5; font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  #panel { position: fixed; left: 12px; top: 12px; background: rgba(12, 18, 26, .85); border: 1px solid #34465a; border-radius: 8px; padding: 10px 12px; width: 250px; }
+  #panel h1 { font-size: 14px; margin: 0 0 8px; }
+  #panel label { display: grid; grid-template-columns: 74px 1fr; align-items: center; gap: 6px; margin: 4px 0; }
+  #panel input { width: 100%; box-sizing: border-box; background: #0f1620; color: inherit; border: 1px solid #34465a; border-radius: 4px; padding: 3px 6px; font: inherit; }
+  #panel button { margin-top: 6px; width: 100%; padding: 5px; background: #2d6cdf; color: #fff; border: 0; border-radius: 4px; font: inherit; cursor: pointer; }
+  #panel button:hover { background: #3a7cf0; }
+  #panel .row { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-top: 6px; }
+  #panel .row label { display: flex; grid-template-columns: none; gap: 4px; margin: 0; white-space: nowrap; }
+  #status { margin-top: 8px; white-space: pre-wrap; color: #9fb3c8; }
+  #attrib { position: fixed; right: 8px; bottom: 6px; font-size: 11px; color: #9fb3c8; background: rgba(12, 18, 26, .7); padding: 3px 8px; border-radius: 4px; }
+  #help { position: fixed; left: 12px; bottom: 6px; font-size: 11px; color: #7f93a8; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="panel">
+  <h1>open-tiles LOD example</h1>
+  <label>server <input id="server" placeholder="same origin"></label>
+  <label>lat <input id="lat" type="number" step="0.0001"></label>
+  <label>lon <input id="lon" type="number" step="0.0001"></label>
+  <label>base zoom <input id="base" type="number" min="1" max="22" title="quadtree root zoom"></label>
+  <label>max zoom <input id="max" type="number" min="1" max="22" title="deepest zoom allowed"></label>
+  <label>maxError <input id="maxError" type="number" min="0.5" step="0.5" title="screen-space error budget in pixels; lower = finer"></label>
+  <label>errorScale <input id="errorScale" type="number" min="0.1" step="0.1" title="multiplier on per-tile geometric error"></label>
+  <div class="row">
+    <label><input id="wire" type="checkbox"> wireframe</label>
+    <label><input id="freeze" type="checkbox"> freeze LOD</label>
+    <label><input id="debug" type="checkbox"> debug boxes</label>
+  </div>
+  <button id="load">Load</button>
+  <div id="status">…</div>
+</div>
+<div id="help">↑/↓ tilt · ←/→ yaw · Q/E roll · W/S speed up/down</div>
+<div id="attrib">Imagery © Esri · Elevation: Mapzen Terrain Tiles (AWS Open Data)</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ---------------------------------------------------------------------------
+// parameters: URL query → inputs; "Load" writes them back to the URL
+
+const $ = id => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const defaults = { server: '', lat: 36.07, lon: -112.10, base: 9, max: 15, maxError: 2, errorScale: 1 };
+for (const k of Object.keys(defaults)) $(k).value = params.get(k) ?? defaults[k];
+$('wire').checked = params.has('wire');
+$('load').onclick = () => {
+  const p = new URLSearchParams();
+  for (const k of Object.keys(defaults)) if ($(k).value !== '') p.set(k, $(k).value);
+  if ($('wire').checked) p.set('wire', '');
+  location.search = p.toString();
+};
+
+const z0 = Math.min(Math.max(Number($('base').value) || 9, 1), 22);
+const maxZoom = Math.min(Math.max(Number($('max').value) || 15, z0), 22);
+const maxError = Math.max(Number($('maxError').value) || 2, 0.5);
+const errorScale = Math.max(Number($('errorScale').value) || 1, 0.1);
+const server = ($('server').value || location.origin).replace(/\/$/, '');
+
+const UPDATE_MS = 250;      // LOD selection cadence
+const MAX_INFLIGHT = 12;    // concurrent GLB fetches
+const MAX_CACHE = 600;      // cached tiles before LRU eviction
+const WINDOW = 16;          // base tiles enumerated each side of the camera
+
+// ---------------------------------------------------------------------------
+// slippy-map math (same formulas as the server's tile.rs / spec §2, §3.3)
+
+function tileAt(lat, lon, zoom) {
+  const n = 2 ** zoom;
+  const latRad = lat * Math.PI / 180;
+  const x = Math.floor((lon + 180) / 360 * n);
+  const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+  return { x: Math.min(Math.max(x, 0), n - 1), y: Math.min(Math.max(y, 0), n - 1) };
+}
+
+function tileSizeM(zoom, y) {
+  const latC = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 0.5) / 2 ** zoom)));
+  return 40_075_016.686 * Math.cos(latC) / 2 ** zoom;
+}
+
+// world frame: origin at the NW corner of the base-zoom tile under (lat, lon),
+// +X east, +Z south, Y metres above sea level. G is that tile's edge (§3.3);
+// a zoom-z tile gets grid edge G / 2^(z - z0) — one quadrant of its parent.
+const ref = tileAt(Number($('lat').value), Number($('lon').value), z0);
+const G = tileSizeM(z0, ref.y);
+const gridEdge = z => G / 2 ** (z - z0);
+const tileOrigin = (z, x, y) => {
+  const g = gridEdge(z), f = 2 ** (z - z0);
+  return { x: (x - ref.x * f) * g, z: (y - ref.y * f) * g, g };
+};
+
+// ---------------------------------------------------------------------------
+// scene
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1d2733);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 2, G * 15);
+const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  dirty = true;
+});
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(0.6, 1.0, 0.4);
+scene.add(sun);
+
+// start above the anchor point looking down at ~45°
+{
+  const n = 2 ** z0, latRad = Number($('lat').value) * Math.PI / 180;
+  const tx = (Number($('lon').value) + 180) / 360 * n;
+  const ty = (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n;
+  const ax = (tx - ref.x) * G, az = (ty - ref.y) * G;
+  camera.position.set(ax, 1000 + G * 1.1, az + G * 1.2);
+  camera.lookAt(ax, 1000, az);
+}
+
+// ---------------------------------------------------------------------------
+// flight controls: held keys rotate around the camera's own axes; W/S scale
+// the forward velocity exponentially (S below the minimum stops dead)
+
+const ROT_SPEED = 0.9;        // rad/s for tilt/yaw, roll a bit faster below
+const MIN_SPEED = 30;         // m/s: first W press starts here
+const MAX_SPEED = 300_000;    // m/s ceiling
+let speed = 0;
+const keys = new Set();
+const FLIGHT_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyQ', 'KeyE', 'KeyW', 'KeyS']);
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || !FLIGHT_KEYS.has(e.code)) return;
+  keys.add(e.code);
+  e.preventDefault();
+});
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+
+function fly(dt) {
+  if (keys.has('ArrowUp')) camera.rotateX(ROT_SPEED * dt);           // tilt
+  if (keys.has('ArrowDown')) camera.rotateX(-ROT_SPEED * dt);
+  if (keys.has('ArrowLeft')) camera.rotateY(ROT_SPEED * dt);         // yaw
+  if (keys.has('ArrowRight')) camera.rotateY(-ROT_SPEED * dt);
+  if (keys.has('KeyQ')) camera.rotateZ(ROT_SPEED * 1.3 * dt);        // roll
+  if (keys.has('KeyE')) camera.rotateZ(-ROT_SPEED * 1.3 * dt);
+  if (keys.has('KeyW')) speed = speed ? Math.min(speed * 2 ** (dt * 1.5), MAX_SPEED) : MIN_SPEED;
+  if (keys.has('KeyS')) { speed *= 2 ** (-dt * 1.5); if (speed < MIN_SPEED) speed = 0; }
+  if (speed) camera.translateZ(-speed * dt);
+}
+
+// ---------------------------------------------------------------------------
+// wireframe, tinted per zoom so the LOD rings are visible
+
+const wireMats = new Map();
+const wireMat = z => {
+  if (!wireMats.has(z))
+    wireMats.set(z, new THREE.MeshBasicMaterial({
+      wireframe: true,
+      color: new THREE.Color().setHSL(((z - z0) * 0.13) % 1, 0.9, 0.6),
+    }));
+  return wireMats.get(z);
+};
+const applyWire = (group, z, on) => group.traverse(o => {
+  if (o.isMesh) o.material = on ? wireMat(z) : o.userData.origMaterial;
+});
+$('wire').onchange = () => {
+  for (const e of cache.values()) if (e.group) applyWire(e.group, e.z, $('wire').checked);
+};
+
+// ---------------------------------------------------------------------------
+// debug boxes: per shown tile, its bounding box (tinted like the wireframe)
+// plus a billboard label with the tile's z/x/y address
+
+function makeLabel(text, color) {
+  const c = document.createElement('canvas');
+  c.width = 512; c.height = 128;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = 'rgba(10, 16, 24, .75)';
+  ctx.fillRect(0, 0, c.width, c.height);
+  ctx.font = 'bold 72px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = color;
+  ctx.fillText(text, c.width / 2, c.height / 2);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: new THREE.CanvasTexture(c), depthTest: false, transparent: true,
+  }));
+  return sprite;
+}
+
+function debugObj(e) {
+  if (e.debug) return e.debug;
+  const { x, z, g } = tileOrigin(e.z, e.x, e.y);
+  const lo = e.ymin < e.ymax ? e.ymin : 0, hi = e.ymin < e.ymax ? e.ymax : 0;
+  const box = new THREE.Box3(new THREE.Vector3(x, lo, z), new THREE.Vector3(x + g, hi, z + g));
+  const color = wireMat(e.z).color;
+  const label = makeLabel(`${e.z}/${e.x}/${e.y}`, `#${color.getHexString()}`);
+  label.position.set(x + g / 2, hi + g * 0.06, z + g / 2);
+  label.scale.set(g * 0.42, g * 0.105, 1);
+  const group = new THREE.Group();
+  group.add(new THREE.Box3Helper(box, color), label);
+  group.visible = false;
+  scene.add(group);
+  e.debug = group;
+  return group;
+}
+
+function disposeDebug(e) {
+  if (!e.debug) return;
+  scene.remove(e.debug);
+  e.debug.traverse(o => {
+    if (o.isSprite) { o.material.map.dispose(); o.material.dispose(); }
+    else if (o.geometry) { o.geometry.dispose(); o.material.dispose(); }
+  });
+  e.debug = null;
+}
+
+function syncDebug() {
+  const on = $('debug').checked;
+  for (const e of cache.values()) {
+    if (on && e.group?.visible) debugObj(e).visible = true;
+    else if (e.debug) e.debug.visible = false;
+  }
+}
+$('debug').onchange = syncDebug;
+
+// ---------------------------------------------------------------------------
+// tile cache and prioritized loader
+//
+// cache: "z/x/y" → { z, x, y, state: loading|ready|missing, group?, dist,
+// pass, lastUsed }. Fetches are dispatched nearest-first with a concurrency
+// cap; queued (unstarted) jobs no longer wanted by the latest pass are
+// dropped. Ready groups live in the scene with .visible toggled.
+
+const loader = new GLTFLoader();
+const cache = new Map();
+const queue = [];
+let inflight = 0, passId = 0, dirty = true;
+let ymin = Infinity, ymax = -Infinity;   // observed terrain range, for tile boxes
+
+function ensure(z, x, y, dist) {
+  const key = `${z}/${x}/${y}`;
+  let e = cache.get(key);
+  if (!e) {
+    e = { key, z, x, y, state: 'loading', started: false, group: null, dist, pass: passId, lastUsed: performance.now() };
+    cache.set(key, e);
+    queue.push(key);
+  }
+  e.dist = dist;
+  e.pass = passId;
+  e.lastUsed = performance.now();
+  return e;
+}
+
+function dispatch() {
+  queue.sort((a, b) => (cache.get(a)?.dist ?? 0) - (cache.get(b)?.dist ?? 0));
+  while (inflight < MAX_INFLIGHT && queue.length) {
+    const e = cache.get(queue.shift());
+    if (!e || e.state !== 'loading' || e.started) continue;
+    if (e.pass !== passId) { cache.delete(e.key); continue; }   // stale, never wanted since
+    e.started = true;
+    inflight++;
+    loader.load(`${server}/${e.key}.glb`,
+      gltf => { onLoaded(e, gltf); inflight--; dirty = true; dispatch(); },
+      undefined,
+      err => { console.warn('tile failed', e.key, err); e.state = 'missing'; inflight--; dirty = true; dispatch(); });
+  }
+}
+
+function onLoaded(e, gltf) {
+  const size = gltf.parser.json.extras?.tile_size_m ?? tileSizeM(e.z, e.y);
+  const g = gltf.scene;
+  e.ymin = Infinity;
+  e.ymax = -Infinity;
+  g.traverse(o => {
+    if (!o.isMesh) return;
+    if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+    const bb = o.geometry.boundingBox;
+    ymin = Math.min(ymin, bb.min.y);
+    ymax = Math.max(ymax, bb.max.y);
+    e.ymin = Math.min(e.ymin, bb.min.y);
+    e.ymax = Math.max(e.ymax, bb.max.y);
+    o.userData.origMaterial = o.material;
+  });
+  const { x, z, g: edge } = tileOrigin(e.z, e.x, e.y);
+  g.position.set(x, 0, z);
+  g.scale.set(edge / size, 1, edge / size);
+  g.visible = false;
+  if ($('wire').checked) applyWire(g, e.z, true);
+  scene.add(g);
+  e.group = g;
+  e.state = 'ready';
+}
+
+function disposeGroup(g) {
+  g.traverse(o => {
+    if (!o.isMesh) return;
+    o.geometry.dispose();
+    const m = o.userData.origMaterial ?? o.material;
+    if (m.map) m.map.dispose();
+    m.dispose();                            // shared wire materials are never here
+  });
+}
+
+// ---------------------------------------------------------------------------
+// LOD selection: one recursive walk per pass (see file header for the metric)
+
+const frustum = new THREE.Frustum();
+const projView = new THREE.Matrix4();
+const splitSet = new Set();               // tiles split last pass, for hysteresis
+let shownGroups = new Set();
+
+function tileBox(z, x, y) {
+  const { x: wx, z: wz, g } = tileOrigin(z, x, y);
+  const lo = ymin < ymax ? ymin - 10 : 0, hi = ymin < ymax ? ymax + 10 : 4000;
+  return new THREE.Box3(new THREE.Vector3(wx, lo, wz), new THREE.Vector3(wx + g, hi, wz + g));
+}
+
+// returns { covered, leaves: [entry] } — covered means the tile's whole
+// footprint is drawable right now; an uncovered split falls back to this
+// tile itself so the parent stays visible until all 4 children are ready.
+function select(z, x, y, sseFactor, newSplit) {
+  const box = tileBox(z, x, y);
+  if (!frustum.intersectsBox(box)) return { covered: true, leaves: [] };
+  const d = Math.max(box.distanceToPoint(camera.position), camera.near);
+  const sse = gridEdge(z) / 256 * errorScale * sseFactor / d;
+  const key = `${z}/${x}/${y}`;
+  const split = z < maxZoom &&
+    (sse > maxError || (splitSet.has(key) && sse > maxError / 1.4));
+
+  if (split) {
+    newSplit.add(key);
+    const kids = [0, 1, 2, 3].map(i =>
+      select(z + 1, 2 * x + (i & 1), 2 * y + (i >> 1), sseFactor, newSplit));
+    if (kids.every(k => k.covered))
+      return { covered: true, leaves: kids.flatMap(k => k.leaves) };
+    const e = cache.get(key);               // children incomplete: fall back
+    if (e?.state === 'ready') { e.lastUsed = performance.now(); return { covered: true, leaves: [e] }; }
+    return { covered: false, leaves: [] };
+  }
+
+  const e = ensure(z, x, y, d);
+  return e.state === 'ready' ? { covered: true, leaves: [e] } : { covered: false, leaves: [] };
+}
+
+function pass() {
+  passId++;
+  projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  frustum.setFromProjectionMatrix(projView);
+  const sseFactor = innerHeight / (2 * Math.tan(camera.fov * Math.PI / 360));
+  const newSplit = new Set();
+
+  // roots: base-zoom tiles near the camera whose box intersects the frustum
+  const n0 = 2 ** z0;
+  const cx = ref.x + Math.floor(camera.position.x / G);
+  const cy = ref.y + Math.floor(camera.position.z / G);
+  const leaves = [];
+  for (let y = Math.max(cy - WINDOW, 0); y <= Math.min(cy + WINDOW, n0 - 1); y++)
+    for (let x = Math.max(cx - WINDOW, 0); x <= Math.min(cx + WINDOW, n0 - 1); x++)
+      leaves.push(...select(z0, x, y, sseFactor, newSplit).leaves);
+
+  splitSet.clear();
+  for (const k of newSplit) splitSet.add(k);
+
+  const newShown = new Set(leaves.map(e => e.group));
+  for (const g of shownGroups) if (!newShown.has(g)) g.visible = false;
+  for (const g of newShown) g.visible = true;
+  shownGroups = newShown;
+  syncDebug();
+
+  dispatch();
+  evict();
+  report(leaves);
+}
+
+function evict() {
+  if (cache.size <= MAX_CACHE) return;
+  const evictable = [...cache.values()]
+    .filter(e => e.state !== 'loading' && !shownGroups.has(e.group))
+    .sort((a, b) => a.lastUsed - b.lastUsed);
+  for (const e of evictable) {
+    if (cache.size <= MAX_CACHE) break;
+    if (e.group) { scene.remove(e.group); disposeGroup(e.group); }
+    disposeDebug(e);
+    cache.delete(e.key);
+  }
+}
+
+const status = $('status');
+function report(leaves) {
+  const perZoom = {};
+  for (const e of leaves) perZoom[e.z] = (perZoom[e.z] ?? 0) + 1;
+  const zooms = Object.keys(perZoom).sort((a, b) => a - b)
+    .map(z => `z${z}:${perZoom[z]}`).join(' ') || 'none';
+  const pending = [...cache.values()].filter(e => e.state === 'loading').length;
+  status.textContent =
+    `root ${z0}/${ref.x}/${ref.y} · G ${(G / 1000).toFixed(1)} km\n` +
+    `tiles ${zooms}\n` +
+    `speed ${speed.toFixed(0)} m/s\n` +
+    `loading ${pending} (${inflight} in flight) · cache ${cache.size}` +
+    (ymin < ymax ? `\nY ${ymin.toFixed(0)}…${ymax.toFixed(0)} m` : '');
+}
+
+// ---------------------------------------------------------------------------
+// main loop: selection every UPDATE_MS (or when a load lands), render always
+
+let lastPass = 0, lastFrame = performance.now();
+renderer.setAnimationLoop(() => {
+  const now = performance.now();
+  fly(Math.min((now - lastFrame) / 1000, 0.1));
+  lastFrame = now;
+  if (!$('freeze').checked && (dirty || now - lastPass > UPDATE_MS)) {
+    dirty = false;
+    lastPass = now;
+    pass();
+  }
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
