@@ -1,5 +1,7 @@
+#!/bin/sh
+
 ECR_REGISTRY=667512625118.dkr.ecr.eu-north-1.amazonaws.com
-IMAGE_TAG=v0.2.3
+IMAGE_TAG=v0.2.4
 
 aws login --profile opentiles-deploy
 
@@ -23,4 +25,5 @@ docker tag \
   "opentiles-server:$IMAGE_TAG" \
   "$ECR_REGISTRY/opentiles-server:$IMAGE_TAG"
 
-  docker push "$ECR_REGISTRY/opentiles-server:$IMAGE_TAG"
+
+docker push "$ECR_REGISTRY/opentiles-server:$IMAGE_TAG"
