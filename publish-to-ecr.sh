@@ -1,7 +1,7 @@
 #!/bin/sh
 
 ECR_REGISTRY=667512625118.dkr.ecr.eu-north-1.amazonaws.com
-IMAGE_TAG=v0.2.4
+IMAGE_TAG=v0.2.5
 
 aws login --profile opentiles-deploy
 
